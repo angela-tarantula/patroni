@@ -1529,6 +1529,17 @@ class Cluster(NamedTuple('Cluster',
         return next(iter(sorted(m.patroni_version for m in self.members if m.patroni_version)), None)
 
 
+class ConfigWrite(NamedTuple):
+    """Result of :meth:`AbstractDCS.set_config_and_maintenance_value`.
+
+    :ivar config: ``True`` if ``/config`` was written.
+    :ivar maintenance: ``True`` if ``/maintenance`` was written.
+    """
+
+    config: bool
+    maintenance: bool
+
+
 class ReturnFalseException(Exception):
     """Exception to be caught by the :func:`catch_return_false_exception` decorator."""
 
@@ -1599,6 +1610,7 @@ class AbstractDCS(ClusterSite, abc.ABC):
 
         * :meth:`~AbstractDCS.set_failover_value`: method to create and/or update the ``failover`` key in the DCS.
         * :meth:`~AbstractDCS.set_config_value`: method to create and/or update the ``failover`` key in the DCS.
+        * :meth:`~AbstractDCS.set_maintenance_value`: method to create and/or update the ``maintenance`` key in the DCS.
         * :meth:`~AbstractDCS.set_sync_state_value`: method to set the synchronous state ``sync`` key in the DCS.
 
     DCS data and key removal methods:
@@ -2153,6 +2165,40 @@ class AbstractDCS(ClusterSite, abc.ABC):
 
         :returns: ``True`` if successfully committed to DCS.
         """
+
+    @abc.abstractmethod
+    def set_maintenance_value(self, value: str, version: Optional[Any] = None) -> bool:
+        """Create or update ``/maintenance`` key in DCS.
+
+        .. note::
+            Unlike :meth:`set_config_value`, a missing *version* does not make the write unconditional: concurrent
+            first writes after a wipe must not both succeed, so exactly one of them creates the key.
+
+        :param value: new value to set in the ``maintenance`` key.
+        :param version: update the key only if it still has this version. If ``None``, create the key only if it
+                        does not exist.
+
+        :returns: ``True`` if successfully committed to DCS.
+        """
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[Any],
+                                         maintenance: str, maintenance_version: Optional[Any]) -> ConfigWrite:
+        """Write ``/config`` and ``/maintenance`` keys, in one atomic operation where the backend supports it.
+
+        .. note::
+            This implementation writes ``/config`` first and ``/maintenance`` only if that succeeded, so on failure
+            ``/maintenance`` may be left behind ``/config``. Backends that can write both keys atomically override it.
+
+        :param config: new value to set in the ``config`` key.
+        :param config_version: as *version* of :meth:`set_config_value`.
+        :param maintenance: new value to set in the ``maintenance`` key.
+        :param maintenance_version: as *version* of :meth:`set_maintenance_value`.
+
+        :returns: which of the two keys were written.
+        """
+        if not self.set_config_value(config, config_version):
+            return ConfigWrite(False, False)
+        return ConfigWrite(True, self.set_maintenance_value(maintenance, maintenance_version))
 
     @abc.abstractmethod
     def touch_member(self, data: Dict[str, Any]) -> bool:

@@ -1,3 +1,5 @@
+import base64
+import json
 import unittest
 
 from unittest.mock import Mock, patch, PropertyMock
@@ -195,6 +197,46 @@ class TestConsul(unittest.TestCase):
     @patch.object(KV, 'put', Mock(return_value=True))
     def test_set_config_value(self):
         self.c.set_config_value('')
+
+    def test_set_maintenance_value(self):
+        with patch.object(KV, 'put', Mock(return_value=True)) as mock_put:
+            self.assertTrue(self.c.set_maintenance_value('{}'))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=0)
+            self.assertTrue(self.c.set_maintenance_value('{}', 5))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=5)
+        with patch.object(KV, 'put', Mock(side_effect=ConsulException)):
+            self.assertFalse(self.c.set_maintenance_value('{}'))
+
+    def test_set_config_and_maintenance_value(self):
+        def kv(verb, key, value, index=None):
+            ret = {'Verb': verb, 'Key': key, 'Value': base64.b64encode(value.encode('utf-8')).decode('utf-8')}
+            if index is not None:
+                ret['Index'] = index
+            return {'KV': ret}
+
+        with patch.object(self.c._client.http.http, 'request') as mock_request:
+            mock_request.return_value.status = 200
+            mock_request.return_value.data = b'{"Results": []}'
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', None, '{"pause":true}', None), (True, True))
+            self.assertEqual(mock_request.call_args[0], ('PUT', 'http://localhost:1/v1/txn'))
+            self.assertEqual(json.loads(mock_request.call_args[1]['body']),
+                             [kv('set', 'service/good/config', '{}'),
+                              kv('cas', 'service/good/maintenance', '{"pause":true}', 0)])
+            self.c.set_config_and_maintenance_value('{}', 5, '{}', 6)
+            self.assertEqual(json.loads(mock_request.call_args[1]['body']),
+                             [kv('cas', 'service/good/config', '{}', 5),
+                              kv('cas', 'service/good/maintenance', '{}', 6)])
+
+            # the transaction goes to the configured datacenter, as kv.get() and kv.put() do
+            with patch.object(self.c._client, 'dc', 'dc2'):
+                self.c.set_config_and_maintenance_value('{}', 5, '{}', 6)
+                self.assertEqual(mock_request.call_args[0], ('PUT', 'http://localhost:1/v1/txn?dc=dc2'))
+
+            # a transaction that is rolled back returns 409
+            mock_request.return_value.status = 409
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', 5, '{}', 6), (False, False))
+            mock_request.return_value.status = 500
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', 5, '{}', 6), (False, False))
 
     @patch.object(Cluster, 'min_version', PropertyMock(return_value=(2, 0)))
     @patch.object(KV, 'put', Mock(side_effect=ConsulException))

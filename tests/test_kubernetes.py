@@ -335,6 +335,60 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
                           Mock(side_effect=k8s_client.rest.ApiException(409, '')), create=True):
             self.k.set_config_value('{}', 1)
 
+    def test_set_maintenance_value(self):
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_patch:
+            # create only: the cached object already carries the annotation, so nothing is written
+            self.assertFalse(self.k.set_maintenance_value('{}'))
+            mock_patch.assert_not_called()
+
+            # create only: the annotation is absent, so the patch is conditional on the cached object's version
+            del self.k._kinds.get(self.k.config_path).metadata.annotations['maintenance']
+            self.assertTrue(self.k.set_maintenance_value('{}'))
+            body = mock_patch.call_args[0][2]
+            self.assertEqual(body.metadata.resource_version, '1')
+            self.assertEqual(body.metadata.annotations, {'maintenance': '{}'})
+
+            self.assertTrue(self.k.set_maintenance_value('{"pause":true}', '2'))
+            self.assertEqual(mock_patch.call_args[0][2].metadata.resource_version, '2')
+
+        # create only: there is no object, so it is created
+        self.k._kinds._object_cache.pop(self.k.config_path)
+        with patch.object(k8s_client.CoreV1Api, 'create_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_create:
+            self.assertTrue(self.k.set_maintenance_value('{}'))
+            mock_create.assert_called_once()
+
+    def test_set_config_and_maintenance_value(self):
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_patch:
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '1', '{"pause":true}', '1'), (True, True))
+            mock_patch.assert_called_once()
+            body = mock_patch.call_args[0][2]
+            self.assertEqual(body.metadata.resource_version, '1')
+            self.assertEqual(body.metadata.annotations, {'config': '{}', 'maintenance': '{"pause":true}'})
+
+            # creating the mirror next to an unconditional /config write is conditional on the cached object
+            self.k._kinds.set(self.k.config_path, k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(
+                name=self.k.config_path, resource_version='4', annotations={'config': '{}'})))
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', None, '{}', None), (True, True))
+            self.assertEqual(mock_patch.call_args[0][2].metadata.resource_version, '4')
+
+            # one object has one resource version, so two different versions mean one of them is stale
+            mock_patch.reset_mock()
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '2', '{}', '1'), (False, False))
+            mock_patch.assert_not_called()
+
+            mock_patch.side_effect = k8s_client.rest.ApiException(409, '')
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '2', '{}', '2'), (False, False))
+
+        # creating the mirror fails if the cached object already carries it, even with a /config version
+        self.k._kinds.set(self.k.config_path, k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(
+            name=self.k.config_path, resource_version='5', annotations={'config': '{}', 'maintenance': '{}'})))
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map', create=True) as mock_patch:
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '5', '{}', None), (False, False))
+            mock_patch.assert_not_called()
+
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_pod', create=True)
     def test_touch_member(self, mock_patch_namespaced_pod):
         mock_patch_namespaced_pod.return_value.metadata.resource_version = '10'

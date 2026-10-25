@@ -10,8 +10,8 @@ import urllib3
 
 from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.etcd import DnsCachingResolver
-from patroni.dcs.etcd3 import AuthFailed, AuthOldRevision, base64_encode, Cluster, Etcd3, \
-    Etcd3Client, Etcd3ClientError, Etcd3Error, InvalidAuthToken, PatroniEtcd3Client, \
+from patroni.dcs.etcd3 import AuthFailed, AuthOldRevision, base64_decode, base64_encode, Cluster, \
+    Etcd3, Etcd3Client, Etcd3ClientError, Etcd3Error, InvalidAuthToken, PatroniEtcd3Client, \
     RetryFailedError, Unavailable, Unknown, UnsupportedEtcdVersion, UserEmpty
 from patroni.postgresql.mpp import get_mpp
 
@@ -373,6 +373,45 @@ class TestEtcd3(BaseTestEtcd3):
 
     def test_set_config_value(self):
         self.etcd3.set_config_value('')
+
+    def test_set_maintenance_value(self):
+        key = base64_encode(self.etcd3.maintenance_path)
+        with patch.object(urllib3.PoolManager, 'urlopen') as mock_urlopen:
+            mock_urlopen.return_value = MockResponse()
+            mock_urlopen.return_value.content = '{"header":{"revision":"7"},"succeeded":true}'
+            self.assertTrue(self.etcd3.set_maintenance_value('{}'))
+            self.assertEqual(json.loads(mock_urlopen.call_args[1]['body'])['compare'],
+                             [{'key': key, 'target': 'CREATE', 'create_revision': '0'}])
+            self.assertTrue(self.etcd3.set_maintenance_value('{}', '6'))
+            self.assertEqual(json.loads(mock_urlopen.call_args[1]['body'])['compare'],
+                             [{'key': key, 'target': 'MOD', 'mod_revision': '6'}])
+            mock_urlopen.return_value.content = '{"header":{"revision":"7"},"succeeded":false}'
+            self.assertFalse(self.etcd3.set_maintenance_value('{}', '6'))
+
+    def test_set_config_and_maintenance_value(self):
+        config_key = base64_encode(self.etcd3.config_path)
+        maintenance_key = base64_encode(self.etcd3.maintenance_path)
+        with patch.object(urllib3.PoolManager, 'urlopen') as mock_urlopen:
+            mock_urlopen.return_value = MockResponse()
+            mock_urlopen.return_value.content = '{"header":{"revision":"7"},"succeeded":true}'
+            self.assertEqual(self.etcd3.set_config_and_maintenance_value('{}', '3', '{"pause":true}', None),
+                             (True, True))
+            body = json.loads(mock_urlopen.call_args[1]['body'])
+            self.assertEqual(body['compare'], [{'key': config_key, 'target': 'MOD', 'mod_revision': '3'},
+                                               {'key': maintenance_key, 'target': 'CREATE', 'create_revision': '0'}])
+            self.assertEqual([base64_decode(op['request_put']['key']) for op in body['success']],
+                             [self.etcd3.config_path, self.etcd3.maintenance_path])
+            # both keys are applied to the local cache, not only the first operation of the transaction
+            for key in (config_key, maintenance_key):
+                self.assertEqual(self.kv_cache.get(key)['mod_revision'], '7')
+
+            # an unconditional write of /config still guards the mirror
+            self.etcd3.set_config_and_maintenance_value('{}', None, '{}', '7')
+            self.assertEqual(json.loads(mock_urlopen.call_args[1]['body'])['compare'],
+                             [{'key': maintenance_key, 'target': 'MOD', 'mod_revision': '7'}])
+
+            mock_urlopen.return_value.content = '{"header":{"revision":"8"},"succeeded":false}'
+            self.assertEqual(self.etcd3.set_config_and_maintenance_value('{}', '7', '{}', '7'), (False, False))
 
     def test_initialize(self):
         self.etcd3.initialize()
