@@ -6,7 +6,7 @@ import consul
 
 from consul import ConsulException, NotFound
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.consul import AbstractDCS, Cluster, Consul, ConsulClient, ConsulError, \
     ConsulInternalError, HTTPClient, InvalidSession, InvalidSessionTTL, RetryFailedError
 from patroni.postgresql.misc import PostgresqlRole, PostgresqlState
@@ -29,6 +29,10 @@ def kv_get(self, key, **kwargs):
                   'ModifyIndex': 1334, 'Value': b''},
                  {'CreateIndex': 1334, 'Flags': 0, 'Key': key + '1/initialize', 'LockIndex': 0,
                   'ModifyIndex': 1334, 'Value': b'postgresql0'},
+                 {'CreateIndex': 1336, 'Flags': 0, 'Key': key + '1/maintenance', 'LockIndex': 0,
+                  'ModifyIndex': 1336, 'Value': b'{"pause": false}'},
+                 {'CreateIndex': 1335, 'Flags': 0, 'Key': key + 'maintenance', 'LockIndex': 0,
+                  'ModifyIndex': 1335, 'Value': b'{"pause": true}'},
                  {'CreateIndex': 1334, 'Flags': 0, 'Key': key + 'initialize', 'LockIndex': 0,
                   'ModifyIndex': 1334, 'Value': b'postgresql0'},
                  {'CreateIndex': 2621, 'Flags': 0, 'Key': key + 'leader', 'LockIndex': 1,
@@ -57,6 +61,10 @@ def kv_get(self, key, **kwargs):
     if key == 'service/legacy/':
         good_cls[1].pop()
         return good_cls
+    if key == 'service/nomaintenance/':
+        good_cls[1].append({'CreateIndex': 1337, 'Flags': 0, 'Key': key + 'config', 'LockIndex': 0,
+                            'ModifyIndex': 1337, 'Value': b'{"pause": true}'})
+        return good_cls[0], [n for n in good_cls[1] if n['Key'] != key + 'maintenance']
     raise ConsulException
 
 
@@ -135,21 +143,28 @@ class TestConsul(unittest.TestCase):
 
     @patch.object(KV, 'delete', Mock())
     def test_get_cluster(self):
+        self.assertEqual(self.c.get_cluster().maintenance, ClusterMaintenance(1335, {'pause': True}))
         self.c._base_path = 'service/test'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
-        self.assertIsInstance(self.c.get_cluster(), Cluster)
+        self.assertIsNone(self.c.get_cluster().maintenance)
         self.c._base_path = 'service/fail'
         self.assertRaises(ConsulError, self.c.get_cluster)
         self.c._base_path = 'service/broken'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
         self.c._base_path = 'service/legacy'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
+        self.c._base_path = 'service/nomaintenance'
+        cluster = self.c.get_cluster()
+        self.assertEqual(cluster.config, ClusterConfig(1337, {'pause': True}, 1337))
+        self.assertIsNone(cluster.maintenance)
 
     def test__get_citus_cluster(self):
         self.c._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
         cluster = self.c.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(1336, {'pause': False}))
+        self.assertIsNone(cluster.workers[1].config)
 
     @patch.object(KV, 'delete', Mock(side_effect=[ConsulException, True, True, True]))
     @patch.object(KV, 'put', Mock(side_effect=[True, ConsulException, InvalidSession]))

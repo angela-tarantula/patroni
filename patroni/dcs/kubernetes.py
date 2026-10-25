@@ -27,7 +27,8 @@ from ..postgresql.misc import PostgresqlRole, PostgresqlState
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, iter_response_objects, \
     keepalive_socket_options, Retry, RetryFailedError, tzutc, uri, USER_AGENT
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -881,6 +882,10 @@ class Kubernetes(AbstractDCS):
                                                       annotations.get(self._CONFIG) or '{}',
                                                       metadata.resource_version if self._CONFIG in annotations else 0)
 
+        # get the maintenance key, which shares the object and its resource version with the configuration
+        maintenance = ClusterMaintenance.from_node(metadata.resource_version, annotations[self._MAINTENANCE]) \
+            if metadata and self._MAINTENANCE in annotations else None
+
         # get timeline history
         history = metadata and TimelineHistory.from_node(metadata.resource_version,
                                                          annotations.get(self._HISTORY) or '[]')
@@ -942,7 +947,8 @@ class Kubernetes(AbstractDCS):
         metadata = sync and sync.metadata
         sync = SyncState.from_node(metadata and metadata.resource_version, metadata and metadata.annotations)
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: Dict[str, Any]) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.

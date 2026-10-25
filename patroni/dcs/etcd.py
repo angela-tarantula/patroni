@@ -26,7 +26,7 @@ from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..request import get as requests_get
 from ..utils import Retry, RetryFailedError, split_host_port, uri, USER_AGENT
-from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, \
+from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, ClusterMaintenance, \
     Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -730,6 +730,10 @@ class Etcd(AbstractEtcd):
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config.modifiedIndex, config.value)
 
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance.modifiedIndex, maintenance.value)
+
         # get timeline history
         history = nodes.get(self._HISTORY)
         history = history and TimelineHistory.from_node(history.modifiedIndex, history.value)
@@ -765,7 +769,8 @@ class Etcd(AbstractEtcd):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: str) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.

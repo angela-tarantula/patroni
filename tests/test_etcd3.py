@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch, PropertyMock
 import etcd
 import urllib3
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.etcd import DnsCachingResolver
 from patroni.dcs.etcd3 import AuthFailed, AuthOldRevision, base64_encode, Cluster, Etcd3, \
     Etcd3Client, Etcd3ClientError, Etcd3Error, InvalidAuthToken, PatroniEtcd3Client, \
@@ -38,6 +38,10 @@ def mock_urlopen(self, method, url, **kwargs):
             "kvs": [
                 {"key": base64_encode('/patroni/test/1/initialize'),
                  "value": base64_encode('12345'), "mod_revision": '1'},
+                {"key": base64_encode('/patroni/test/1/maintenance'),
+                 "value": base64_encode('{"pause": false}'), "mod_revision": '3'},
+                {"key": base64_encode('/patroni/test/maintenance'),
+                 "value": base64_encode('{"pause": true}'), "mod_revision": '2'},
                 {"key": base64_encode('/patroni/test/leader'),
                  "value": base64_encode('foo'), "lease": "bla", "mod_revision": '1'},
                 {"key": base64_encode('/patroni/test/members/foo'),
@@ -268,7 +272,9 @@ class TestEtcd3(BaseTestEtcd3):
         self.etcd3.get_cluster()
 
     def test_get_cluster(self):
-        self.assertIsInstance(self.etcd3.get_cluster(), Cluster)
+        cluster = self.etcd3.get_cluster()
+        self.assertIsInstance(cluster, Cluster)
+        self.assertEqual(cluster.maintenance, ClusterMaintenance('2', {'pause': True}))
         self.client._kv_cache = None
         with patch.object(urllib3.PoolManager, 'urlopen') as mock_urlopen:
             mock_urlopen.return_value = MockResponse()
@@ -280,7 +286,17 @@ class TestEtcd3(BaseTestEtcd3):
                      "mod_revision": '1'}
                 ]
             })
-            self.assertIsInstance(self.etcd3.get_cluster(), Cluster)
+            self.assertIsNone(self.etcd3.get_cluster().maintenance)
+            mock_urlopen.return_value.content = json.dumps({
+                "header": {"revision": "1"},
+                "kvs": [
+                    {"key": base64_encode('/patroni/test/config'),
+                     "value": base64_encode('{"pause": true}'), "mod_revision": '1'}
+                ]
+            })
+            cluster = self.etcd3.get_cluster()
+            self.assertEqual(cluster.config, ClusterConfig('1', {'pause': True}, '1'))
+            self.assertIsNone(cluster.maintenance)
             mock_urlopen.return_value.content = json.dumps({
                 "header": {"revision": "1"},
                 "kvs": [
@@ -298,6 +314,8 @@ class TestEtcd3(BaseTestEtcd3):
         cluster = self.etcd3.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance('3', {'pause': False}))
+        self.assertIsNone(cluster.workers[1].config)
 
     def test_touch_member(self):
         self.etcd3.touch_member({})
