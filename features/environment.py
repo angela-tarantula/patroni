@@ -1204,3 +1204,6 @@ def before_scenario(context, scenario):
         scenario.skip('Flaky test with Raft')
     if 'reject-duplicate-name' in scenario.effective_tags and context.dcs_ctl.name() == 'kubernetes':
         scenario.skip('Unique name check is skipped with Kubernetes')
+    if 'dcs-wipe' in scenario.effective_tags and context.dcs_ctl.name() in ('raft', 'kubernetes'):
+        scenario.skip('wiping the DCS from tests would also remove the pods on Kubernetes '
+                      'or leave the keys with the members on Raft')
