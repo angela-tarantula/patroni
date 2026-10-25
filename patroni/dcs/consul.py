@@ -20,7 +20,7 @@ from ..exceptions import DCSError
 from ..postgresql.misc import PostgresqlRole, PostgresqlState
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, parse_bool, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
-from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, \
+from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, ClusterMaintenance, \
     Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -382,6 +382,10 @@ class Consul(AbstractDCS):
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config['ModifyIndex'], config['Value'])
 
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance['ModifyIndex'], maintenance['Value'])
+
         # get timeline history
         history = nodes.get(self._HISTORY)
         history = history and TimelineHistory.from_node(history['ModifyIndex'], history['Value'])
@@ -417,7 +421,8 @@ class Consul(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     @property
     def _consistency(self) -> str:

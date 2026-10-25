@@ -11,7 +11,7 @@ from unittest.mock import Mock, mock_open, patch, PropertyMock
 
 import urllib3
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterMaintenance, get_dcs
 from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed, \
     K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException, Retry, \
     RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
@@ -24,7 +24,7 @@ from . import MockResponse, SleepException
 def mock_list_namespaced_config_map(*args, **kwargs):
     k8s_group_label = get_mpp({'citus': {'group': 0, 'database': 'postgres'}}).k8s_group_label
     metadata = {'resource_version': '1', 'labels': {'f': 'b'}, 'name': 'test-config',
-                'annotations': {'initialize': '123', 'config': '[]', 'history': '{}'}}
+                'annotations': {'initialize': '123', 'config': '[]', 'history': '{}', 'maintenance': '{"pause": true}'}}
     items = [k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata))]
     metadata.update({'name': 'test-leader',
                      'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s',
@@ -44,7 +44,8 @@ def mock_list_namespaced_config_map(*args, **kwargs):
     metadata.update({'name': 'test-1-leader', 'labels': {k8s_group_label: '1'},
                      'annotations': {'leader': 'p-3', 'ttl': '30s'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
-    metadata.update({'name': 'test-2-config', 'labels': {k8s_group_label: '2'}, 'annotations': {}})
+    metadata.update({'name': 'test-2-config', 'labels': {k8s_group_label: '2'},
+                     'annotations': {'maintenance': '{"pause": false}'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
 
     metadata = k8s_client.V1ObjectMeta(resource_version='1')
@@ -263,7 +264,7 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
 
     @patch('time.monotonic', Mock(return_value=time.monotonic() + 100))
     def test_get_cluster(self):
-        self.k.get_cluster()
+        self.assertEqual(self.k.get_cluster().maintenance, ClusterMaintenance('1', {'pause': True}))
 
         with patch.object(Kubernetes, '_wait_caches', Mock(side_effect=Exception)):
             self.assertRaises(KubernetesError, self.k.get_cluster)
@@ -273,6 +274,12 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
         cluster = self.k.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertTrue(cluster.config.modify_version)
+        self.assertIsNone(cluster.maintenance)
+        self.assertIsNone(cluster.workers[1].maintenance)
+        # an object holding only the mirror holds no configuration
+        self.assertEqual(cluster.workers[2].maintenance, ClusterMaintenance('1', {'pause': False}))
+        self.assertEqual(cluster.workers[2].config.modify_version, 0)
 
     @patch('patroni.dcs.kubernetes.logger.error')
     def test_get_mpp_coordinator(self, mock_logger):

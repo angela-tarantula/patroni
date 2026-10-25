@@ -587,6 +587,63 @@ class ClusterConfig(NamedTuple):
         return ClusterConfig(version, data, version if modify_version is None else modify_version)
 
 
+class ClusterMaintenance(NamedTuple):
+    """Immutable object (namedtuple) which represents the ``/maintenance`` key, the mirror of ``pause``.
+
+    :ivar version: version number for the object.
+    :ivar data: dictionary stored in the key, empty if the value could not be parsed.
+    """
+
+    version: _Version
+    data: Dict[str, Any]
+
+    @staticmethod
+    def from_node(version: _Version, value: str) -> 'ClusterMaintenance':
+        """Factory method to parse *value* as the content of the ``maintenance`` key.
+
+        .. note::
+            A value that cannot be parsed holds no decision, but keeps its *version*, so that writers can
+            overwrite it with a conditional write.
+
+        :param version: version number for object.
+        :param value: raw JSON serialized data, if not parsable replaced with an empty dictionary.
+
+        :returns: constructed :class:`ClusterMaintenance` instance.
+
+        :Example:
+
+            >>> ClusterMaintenance.from_node(1, '{"pause": true}').pause
+            True
+
+            >>> ClusterMaintenance.from_node(1, '{"pause": false, "foo": "bar"}').data
+            {'pause': False, 'foo': 'bar'}
+
+            >>> ClusterMaintenance.from_node(1, '{')
+            ClusterMaintenance(version=1, data={})
+
+            >>> ClusterMaintenance.from_node(1, '[]').pause is None
+            True
+
+            >>> ClusterMaintenance.from_node(1, '{"pause": "on"}').pause is None
+            True
+        """
+        try:
+            json_data = json.loads(value)
+            if isinstance(json_data, dict):
+                data = cast(Dict[str, Any], json_data)
+            else:
+                raise PatroniAssertionError('not a dict')
+        except (PatroniAssertionError, TypeError, ValueError):
+            data = {}
+        return ClusterMaintenance(version, data)
+
+    @property
+    def pause(self) -> Optional[bool]:
+        """The recorded pause decision, or ``None`` if the key holds no decision."""
+        pause = self.data.get('pause')
+        return pause if isinstance(pause, bool) else None
+
+
 class SyncState(NamedTuple):
     """Immutable object (namedtuple) which represents last observed synchronous replication state.
 
@@ -866,7 +923,8 @@ class Cluster(NamedTuple('Cluster',
                           ('sync', SyncState),
                           ('history', Optional[TimelineHistory]),
                           ('failsafe', Optional[Dict[str, str]]),
-                          ('workers', Dict[int, 'Cluster'])])):
+                          ('workers', Dict[int, 'Cluster']),
+                          ('maintenance', Optional[ClusterMaintenance])])):
     """Immutable object (namedtuple) which represents PostgreSQL or MPP cluster.
 
     .. note::
@@ -886,12 +944,34 @@ class Cluster(NamedTuple('Cluster',
     :ivar failsafe: failsafe topology. Node is allowed to become the leader only if its name is found in this list.
     :ivar workers: dictionary of workers of the MPP cluster, optional. Each key representing the group and the
                    corresponding value is a :class:`Cluster` instance.
+    :ivar maintenance: reference to :class:`ClusterMaintenance` object, optional. ``None`` if the key is absent.
     """
 
     def __new__(cls, *args: Any, **kwargs: Any):
-        """Make workers argument optional and set it to an empty dict object."""
-        if len(args) < len(cls._fields) and 'workers' not in kwargs:
-            kwargs['workers'] = {}
+        """Make *workers* and *maintenance* arguments optional.
+
+        *workers* defaults to a new empty :class:`dict` object and *maintenance* to ``None``.
+
+        :Example:
+
+            >>> cluster = Cluster(None, None, None, Status.empty(), [], None, SyncState.empty(), None, None)
+            >>> cluster.workers, cluster.maintenance
+            ({}, None)
+
+            >>> cluster.workers is Cluster.empty().workers
+            False
+
+            >>> maintenance = ClusterMaintenance(1, {'pause': True})
+            >>> Cluster(*cluster[:9], maintenance=maintenance).maintenance is maintenance
+            True
+
+            >>> Cluster(*cluster[:9], {}, maintenance).maintenance is maintenance
+            True
+        """
+        defaults: Dict[str, Callable[[], Any]] = {'workers': dict, 'maintenance': lambda: None}
+        for i, name in enumerate(cls._fields):
+            if name in defaults and len(args) <= i and name not in kwargs:
+                kwargs[name] = defaults[name]()
         return super(Cluster, cls).__new__(cls, *args, **kwargs)
 
     @property
@@ -912,10 +992,18 @@ class Cluster(NamedTuple('Cluster',
         """Validate definition of all attributes of this :class:`Cluster` instance.
 
         :returns: ``True`` if all attributes of the current :class:`Cluster` are unpopulated.
+
+        :Example:
+
+            >>> Cluster.empty().is_empty()
+            True
+
+            >>> Cluster(*Cluster.empty()[:10], ClusterMaintenance(1, {})).is_empty()
+            False
         """
         return all((self.initialize is None, self.config is None, self.leader is None, self.status.is_empty(),
                     self.members == [], self.failover is None, self.sync.version is None,
-                    self.history is None, self.failsafe is None, self.workers == {}))
+                    self.history is None, self.failsafe is None, self.workers == {}, self.maintenance is None))
 
     def __len__(self) -> int:
         """Implement ``len`` function capability.
@@ -1534,6 +1622,7 @@ class AbstractDCS(ClusterSite, abc.ABC):
 
     _INITIALIZE = 'initialize'
     _CONFIG = 'config'
+    _MAINTENANCE = 'maintenance'
     _LEADER = 'leader'
     _FAILOVER = 'failover'
     _HISTORY = 'history'
@@ -1596,6 +1685,11 @@ class AbstractDCS(ClusterSite, abc.ABC):
     def config_path(self) -> str:
         """Get the client path for ``config``."""
         return self.client_path(self._CONFIG)
+
+    @property
+    def maintenance_path(self) -> str:
+        """Get the client path for ``maintenance``."""
+        return self.client_path(self._MAINTENANCE)
 
     @property
     def members_path(self) -> str:

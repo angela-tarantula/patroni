@@ -16,7 +16,8 @@ from pysyncobj.utility import TcpUtility
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..utils import validate_directory
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 # Mapping from Patroni snake_case config keys to pysyncobj camelCase SyncObjConf kwargs.
 # Ordered to reflect the logical dependency chain used in constraint validation.
@@ -388,6 +389,10 @@ class Raft(AbstractDCS):
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config['index'], config['value'])
 
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance['index'], maintenance['value'])
+
         # get timeline history
         history = nodes.get(self._HISTORY)
         history = history and TimelineHistory.from_node(history['index'], history['value'])
@@ -422,7 +427,8 @@ class Raft(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: str) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.

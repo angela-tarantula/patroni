@@ -22,7 +22,7 @@ from ..exceptions import DCSError, PatroniException
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, enable_keepalive, iter_response_objects, \
     parse_bool, RetryFailedError, USER_AGENT, WHITESPACE_RE
-from . import catch_return_false_exception, Cluster, ClusterConfig, \
+from . import catch_return_false_exception, Cluster, ClusterConfig, ClusterMaintenance, \
     Failover, Leader, Member, Status, SyncState, TimelineHistory
 from .etcd import AbstractEtcd, AbstractEtcdClientWithFailover, catch_etcd_errors, \
     DnsCachingResolver, Retry, StaleEtcdNode, StaleEtcdNodeGuard
@@ -864,6 +864,10 @@ class Etcd3(AbstractEtcd):
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config['mod_revision'], config['value'])
 
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance['mod_revision'], maintenance['value'])
+
         # get timeline history
         history = nodes.get(self._HISTORY)
         history = history and TimelineHistory.from_node(history['mod_revision'], history['value'])
@@ -901,7 +905,8 @@ class Etcd3(AbstractEtcd):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: str) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.
