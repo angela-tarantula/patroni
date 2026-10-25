@@ -1,3 +1,4 @@
+import base64
 import unittest
 
 from unittest.mock import Mock, patch, PropertyMock
@@ -101,6 +102,7 @@ class TestHTTPClient(unittest.TestCase):
 KV = consul.Consul.KV if hasattr(consul.Consul, 'KV') else consul.api.kv.KV
 Session = consul.Consul.Session if hasattr(consul.Consul, 'Session') else consul.api.session.Session
 Agent = consul.Consul.Agent if hasattr(consul.Consul, 'Agent') else consul.api.agent.Agent
+Txn = consul.Consul.Txn if hasattr(consul.Consul, 'Txn') else consul.api.txn.Txn
 
 
 @patch.object(KV, 'get', kv_get)
@@ -195,6 +197,33 @@ class TestConsul(unittest.TestCase):
     @patch.object(KV, 'put', Mock(return_value=True))
     def test_set_config_value(self):
         self.c.set_config_value('')
+
+    def test_set_maintenance_value(self):
+        with patch.object(KV, 'put', Mock(return_value=True)) as mock_put:
+            self.assertTrue(self.c.set_maintenance_value('{}'))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=0)
+            self.assertTrue(self.c.set_maintenance_value('{}', 5))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=5)
+        with patch.object(KV, 'put', Mock(side_effect=ConsulException)):
+            self.assertFalse(self.c.set_maintenance_value('{}'))
+
+    def test_set_config_and_maintenance_value(self):
+        def kv(verb, key, value, index=None):
+            ret = {'Verb': verb, 'Key': key, 'Value': base64.b64encode(value.encode('utf-8')).decode('utf-8')}
+            if index is not None:
+                ret['Index'] = index
+            return {'KV': ret}
+
+        with patch.object(Txn, 'put', Mock(return_value={'Results': []})) as mock_put:
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', None, '{"pause":true}', None), (True, True))
+            self.assertEqual(mock_put.call_args[0][0], [kv('set', 'service/good/config', '{}'),
+                                                        kv('cas', 'service/good/maintenance', '{"pause":true}', 0)])
+            self.c.set_config_and_maintenance_value('{}', 5, '{}', 6)
+            self.assertEqual(mock_put.call_args[0][0], [kv('cas', 'service/good/config', '{}', 5),
+                                                        kv('cas', 'service/good/maintenance', '{}', 6)])
+        # a transaction that is rolled back returns 409
+        with patch.object(Txn, 'put', Mock(side_effect=ConsulException)):
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', 5, '{}', 6), (False, False))
 
     @patch.object(Cluster, 'min_version', PropertyMock(return_value=(2, 0)))
     @patch.object(KV, 'put', Mock(side_effect=ConsulException))

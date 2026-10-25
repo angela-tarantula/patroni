@@ -847,6 +847,12 @@ class Etcd(AbstractEtcd):
         return bool(self._client.write(self.config_path, value, prevIndex=version or 0))
 
     @catch_etcd_errors
+    def set_maintenance_value(self, value: str, version: Optional[int] = None) -> bool:
+        if version is None:
+            return bool(self._client.write(self.maintenance_path, value, prevExist=False))
+        return bool(self._client.write(self.maintenance_path, value, prevIndex=version))
+
+    @catch_etcd_errors
     def _write_leader_optime(self, last_lsn: str) -> bool:
         return bool(self._client.set(self.leader_optime_path, last_lsn))
 

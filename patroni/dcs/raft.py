@@ -489,6 +489,11 @@ class Raft(AbstractDCS):
     def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
         return self._sync_obj.set(self.config_path, value, prevIndex=version) is not False
 
+    def set_maintenance_value(self, value: str, version: Optional[int] = None) -> bool:
+        if version is None:
+            return self._sync_obj.set(self.maintenance_path, value, prevExist=False) is not False
+        return self._sync_obj.set(self.maintenance_path, value, prevIndex=version) is not False
+
     def touch_member(self, data: Dict[str, Any]) -> bool:
         value = json.dumps(data, separators=(',', ':'))
         return self._sync_obj.set(self.member_path, value, self._ttl, timeout=2) is not False
