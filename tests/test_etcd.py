@@ -9,7 +9,7 @@ import urllib3.util.connection
 from dns.exception import DNSException
 from urllib3.exceptions import ReadTimeoutError
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.etcd import AbstractDCS, Cluster, DnsCachingResolver, Etcd, EtcdClient, EtcdError
 from patroni.exceptions import DCSError
 from patroni.postgresql.mpp import get_mpp
@@ -48,10 +48,14 @@ def etcd_read(self, key, **kwargs):
     response = {"action": "get", "node": {"key": "/service/batman5", "dir": True, "nodes": [
                 {"key": "/service/batman5/1", "dir": True, "nodes": [
                     {"key": "/service/batman5/1/initialize", "value": "2164261704",
-                     "modifiedIndex": 20729, "createdIndex": 20729}],
+                     "modifiedIndex": 20729, "createdIndex": 20729},
+                    {"key": "/service/batman5/1/maintenance", "value": '{"pause": false}',
+                     "modifiedIndex": 20730, "createdIndex": 20730}],
                  "modifiedIndex": 20437, "createdIndex": 20437},
                 {"key": "/service/batman5/config", "value": '{"synchronous_mode": 0, "failsafe_mode": true}',
                  "modifiedIndex": 1582, "createdIndex": 1582},
+                {"key": "/service/batman5/maintenance", "value": '{"pause": true}',
+                 "modifiedIndex": 1583, "createdIndex": 1583},
                 {"key": "/service/batman5/failover", "value": "",
                  "modifiedIndex": 1582, "createdIndex": 1582},
                 {"key": "/service/batman5/initialize", "value": "postgresql0",
@@ -85,6 +89,11 @@ def etcd_read(self, key, **kwargs):
         response['node']['nodes'].pop()
     if key == '/service/broken/':
         response['node']['nodes'][-1]['value'] = '{'
+    if key == '/service/nomaintenance/':
+        response['node']['nodes'] = [n for n in response['node']['nodes']
+                                     if n['key'] != '/service/batman5/maintenance']
+        next(n for n in response['node']['nodes'] if n['key'] == '/service/batman5/config')['value'] = \
+            '{"pause": true}'
     result = etcd.EtcdResult(**response)
     result.etcd_index = 0
     return result
@@ -292,14 +301,20 @@ class TestEtcd(unittest.TestCase):
     def test_get_cluster(self):
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
+        self.assertEqual(cluster.maintenance, ClusterMaintenance(1583, {'pause': True}))
         self.etcd._base_path = '/service/legacy'
         self.assertIsInstance(self.etcd.get_cluster(), Cluster)
         self.etcd._base_path = '/service/broken'
         self.assertIsInstance(self.etcd.get_cluster(), Cluster)
+        self.etcd._base_path = '/service/nomaintenance'
+        cluster = self.etcd.get_cluster()
+        self.assertEqual(cluster.config, ClusterConfig(1582, {'pause': True}, 1582))
+        self.assertIsNone(cluster.maintenance)
         self.etcd._base_path = '/service/nocluster'
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsNone(cluster.leader)
+        self.assertIsNone(cluster.maintenance)
         self.etcd._base_path = '/service/noleader'
         self.assertRaises(EtcdError, self.etcd.get_cluster)
 
@@ -308,6 +323,8 @@ class TestEtcd(unittest.TestCase):
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(20730, {'pause': False}))
+        self.assertIsNone(cluster.workers[1].config)
         self.etcd._base_path = '/service/nocluster'
         self.assertTrue(self.etcd.get_cluster().is_empty())
 

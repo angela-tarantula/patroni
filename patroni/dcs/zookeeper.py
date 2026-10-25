@@ -16,7 +16,8 @@ from kazoo.security import ACL, make_acl
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -239,6 +240,10 @@ class ZooKeeper(AbstractDCS):
         config = self.get_node(path + self._CONFIG, watch=self._watcher) if self._CONFIG in nodes else None
         config = config and ClusterConfig.from_node(config[1].version, config[0], config[1].mzxid)
 
+        # get the maintenance key
+        maintenance = self.get_node(path + self._MAINTENANCE) if self._MAINTENANCE in nodes else None
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance[1].version, maintenance[0])
+
         # get timeline history
         history = self.get_node(path + self._HISTORY) if self._HISTORY in nodes else None
         history = history and TimelineHistory.from_node(history[1].mzxid, history[0])
@@ -271,7 +276,8 @@ class ZooKeeper(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _mpp_cluster_loader(self, path: str) -> Dict[int, Cluster]:
         """Load and build all PostgreSQL clusters from a single MPP cluster.

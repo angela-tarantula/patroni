@@ -9,7 +9,7 @@ from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.protocol.states import KeeperState, WatchedEvent, ZnodeStat
 from kazoo.retry import RetryFailedError
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.zookeeper import Cluster, PatroniKazooClient, \
     PatroniSequentialThreadingHandler, ZooKeeper, ZooKeeperError
 from patroni.postgresql.mpp import get_mpp
@@ -58,6 +58,12 @@ class MockKazooClient(Mock):
                     ZnodeStat(0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0))
         elif path.endswith('/failsafe'):
             return (b'{a}', ZnodeStat(0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0))
+        elif path.endswith('/config'):
+            return (b'{"pause": true}', ZnodeStat(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        elif path == '/service/test/1/maintenance':
+            return (b'{"pause": false}', ZnodeStat(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        elif path.endswith('/maintenance'):
+            return (b'{"pause": true}', ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         return (b'', ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
     @staticmethod
@@ -66,8 +72,13 @@ class MockKazooClient(Mock):
             raise TypeError("Invalid type for 'path' (string expected)")
         if path.startswith('/no_node'):
             raise NoNodeError
-        elif path in ['/service/bla/', '/service/test/']:
-            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', '0', '1']
+        elif path == '/service/bla/':
+            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', 'config', '0', '1']
+        elif path == '/service/test/':
+            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', 'maintenance',
+                    '0', '1']
+        elif path == '/service/test/1/':
+            return ['maintenance']
         return ['foo', 'bar', 'buzz']
 
     def create(self, path, value=b"", acl=None, ephemeral=False, sequence=False, makepath=False):
@@ -171,7 +182,10 @@ class TestZooKeeper(unittest.TestCase):
 
     def test__cluster_loader(self):
         self.zk._base_path = self.zk._base_path.replace('test', 'bla')
-        self.zk._postgresql_cluster_loader(self.zk.client_path(''))
+        cluster = self.zk._postgresql_cluster_loader(self.zk.client_path(''))
+        # the version is the znode's data version and the modify version its mzxid
+        self.assertEqual(cluster.config, ClusterConfig(0, {'pause': True}, 1))
+        self.assertIsNone(cluster.maintenance)
         self.zk._base_path = self.zk._base_path = '/broken'
         self.zk._postgresql_cluster_loader(self.zk.client_path(''))
         self.zk._base_path = self.zk._base_path = '/legacy'
@@ -182,6 +196,9 @@ class TestZooKeeper(unittest.TestCase):
     def test_get_cluster(self):
         cluster = self.zk.get_cluster()
         self.assertEqual(cluster.status.last_lsn, 500)
+        self.assertEqual(cluster.maintenance, ClusterMaintenance(0, {'pause': True}))
+        self.zk._base_path = '/service/foo'
+        self.assertIsNone(self.zk.get_cluster().maintenance)
 
     def test__get_citus_cluster(self):
         self.zk._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
@@ -189,6 +206,8 @@ class TestZooKeeper(unittest.TestCase):
             cluster = self.zk.get_cluster()
             self.assertIsInstance(cluster, Cluster)
             self.assertIsInstance(cluster.workers[1], Cluster)
+            self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(1, {'pause': False}))
+            self.assertIsNone(cluster.workers[1].config)
 
     @patch('patroni.dcs.logger.error')
     def test_get_mpp_coordinator(self, mock_logger):
