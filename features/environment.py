@@ -442,6 +442,10 @@ class AbstractDcsController(AbstractController):
     def cleanup_service_tree(self):
         """ clean all contents stored in the tree used for the tests """
 
+    def wipe(self):
+        """ remove all keys stored in the tree used for the tests while Patroni keeps running """
+        self.cleanup_service_tree()
+
     @classmethod
     def get_subclasses(cls):
         for subclass in cls.__subclasses__():
@@ -705,6 +709,14 @@ class KubernetesController(AbstractExternalDcsController):
             if len(result.items) < 1:
                 break
 
+    def wipe(self):
+        self._api.delete_collection_namespaced_endpoints(self._namespace, label_selector=self._label_selector)
+        # member data is the 'status' annotation on each pod
+        result = self._api.list_namespaced_pod(self._namespace, label_selector=self._label_selector)
+        for pod in result.items:
+            self._api.patch_namespaced_pod(pod.metadata.name, self._namespace,
+                                           {'metadata': {'annotations': {'status': None}}})
+
 
 class ZooKeeperController(AbstractExternalDcsController):
 
@@ -800,6 +812,9 @@ class RaftController(AbstractDcsController):
 
     def set(self, key, value):
         self._raft.set(self.path(key), value)
+
+    def wipe(self):
+        self._raft.delete(self.path(scope=''), recursive=True)
 
     def cleanup_service_tree(self):
         from patroni.dcs.raft import KVStoreTTL
@@ -1202,6 +1217,3 @@ def before_scenario(context, scenario):
         scenario.skip('it is not possible to control state of {0} from tests'.format(context.dcs_ctl.name()))
     if 'reject-duplicate-name' in scenario.effective_tags and context.dcs_ctl.name() == 'raft':
         scenario.skip('Flaky test with Raft')
-    if 'dcs-wipe' in scenario.effective_tags and context.dcs_ctl.name() in ('raft', 'kubernetes'):
-        scenario.skip('wiping the DCS from tests would also remove the pods on Kubernetes '
-                      'or leave the keys with the members on Raft')

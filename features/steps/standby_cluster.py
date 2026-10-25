@@ -98,4 +98,4 @@ def demote_cluster(context, scope):
 
 @step('I wipe the DCS')
 def wipe_dcs(context):
-    context.dcs_ctl.cleanup_service_tree()
+    context.dcs_ctl.wipe()
