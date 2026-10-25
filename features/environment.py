@@ -1202,3 +1202,6 @@ def before_scenario(context, scenario):
         scenario.skip('it is not possible to control state of {0} from tests'.format(context.dcs_ctl.name()))
     if 'reject-duplicate-name' in scenario.effective_tags and context.dcs_ctl.name() == 'raft':
         scenario.skip('Flaky test with Raft')
+    if 'dcs-wipe' in scenario.effective_tags and context.dcs_ctl.name() in ('raft', 'kubernetes'):
+        scenario.skip('wiping the DCS from tests would also remove the pods on Kubernetes '
+                      'or leave the keys with the members on Raft')
