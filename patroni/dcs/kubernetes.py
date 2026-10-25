@@ -28,7 +28,7 @@ from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, iter_response_objects, \
     keepalive_socket_options, Retry, RetryFailedError, tzutc, uri, USER_AGENT
 from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
-    Failover, Leader, Member, Status, SyncState, TimelineHistory
+    ConfigWrite, Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -1370,6 +1370,42 @@ class Kubernetes(AbstractDCS):
 
     def set_config_value(self, value: str, version: Optional[str] = None) -> bool:
         return self.patch_or_create_config({self._CONFIG: value}, version, bool(self._config_resource_version), False)
+
+    def _patch_config_with_maintenance(self, annotations: Dict[str, Any], resource_version: Optional[str],
+                                       create_only: bool) -> bool:
+        """Patch the config object conditionally, writing the ``maintenance`` annotation among *annotations*.
+
+        The ``maintenance`` annotation has no version of its own. When it is to be created only if absent, the write
+        fails if the cached object already carries it, and is otherwise conditional on *resource_version* or, without
+        one, on the cached object's resource version. If there is no object, it is created, which fails if another
+        writer created it first.
+
+        :param annotations: annotations to write, including ``maintenance``.
+        :param resource_version: the resource version the object must still have.
+        :param create_only: ``True`` if the ``maintenance`` annotation must not exist yet.
+
+        :returns: ``True`` if the object was written.
+        """
+        if create_only:
+            config = self._kinds.get(self.config_path)
+            if config:
+                if self._MAINTENANCE in (config.metadata.annotations or EMPTY_DICT):
+                    return False
+                resource_version = resource_version or config.metadata.resource_version
+        return self.patch_or_create_config(annotations, resource_version, bool(resource_version), False)
+
+    def set_maintenance_value(self, value: str, version: Optional[str] = None) -> bool:
+        return self._patch_config_with_maintenance({self._MAINTENANCE: value}, version, version is None)
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[str],
+                                         maintenance: str, maintenance_version: Optional[str]) -> ConfigWrite:
+        # Both annotations live on one object, so both keys report its single resource version, and one patch
+        # conditional on it writes both atomically. Two different versions mean one of them is stale.
+        if config_version is not None and maintenance_version is not None and config_version != maintenance_version:
+            return ConfigWrite(False, False)
+        ret = self._patch_config_with_maintenance({self._CONFIG: config, self._MAINTENANCE: maintenance},
+                                                  config_version or maintenance_version, maintenance_version is None)
+        return ConfigWrite(ret, ret)
 
     @catch_kubernetes_errors
     def touch_member(self, data: Dict[str, Any]) -> bool:

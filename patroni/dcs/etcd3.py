@@ -23,7 +23,7 @@ from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, enable_keepalive, iter_response_objects, \
     parse_bool, RetryFailedError, USER_AGENT, WHITESPACE_RE
 from . import catch_return_false_exception, Cluster, ClusterConfig, ClusterMaintenance, \
-    Failover, Leader, Member, Status, SyncState, TimelineHistory
+    ConfigWrite, Failover, Leader, Member, Status, SyncState, TimelineHistory
 from .etcd import AbstractEtcd, AbstractEtcdClientWithFailover, catch_etcd_errors, \
     DnsCachingResolver, Retry, StaleEtcdNode, StaleEtcdNodeGuard
 
@@ -468,9 +468,11 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
         return self.call_rpc('/lease/keepalive', {'ID': ID}, retry).get('result', {}).get('TTL')
 
     @_handle_auth_errors
-    def txn(self, compare: Dict[str, Any], success: Dict[str, Any],
+    def txn(self, compare: Union[Dict[str, Any], List[Dict[str, Any]]],
+            success: Union[Dict[str, Any], List[Dict[str, Any]]],
             failure: Optional[Dict[str, Any]] = None, *, retry: Optional[Retry] = None) -> Dict[str, Any]:
-        fields = {'compare': [compare], 'success': [success]}
+        fields = {'compare': compare if isinstance(compare, list) else [compare],
+                  'success': success if isinstance(success, list) else [success]}
         if failure:
             fields['failure'] = [failure]
         ret = self.call_rpc('/kv/txn', fields, retry)
@@ -748,7 +750,7 @@ class PatroniEtcd3Client(Etcd3Client):
         ret = super(PatroniEtcd3Client, self).call_rpc(method, fields, retry)
 
         if self._kv_cache:
-            value = delete = None
+            operations: List[Dict[str, Any]] = []
             # For the 'failure' case we only support a second (nested) transaction that attempts to
             # update/delete the same keys. Anything more complex than that we don't need and therefore it doesn't
             # make sense to write a universal response analyzer and we can just check expected JSON path.
@@ -756,23 +758,25 @@ class PatroniEtcd3Client(Etcd3Client):
                     and (ret.get('succeeded') or 'failure' in fields and 'request_txn' in fields['failure'][0]
                          and ret.get('responses', [{'response_txn': {'succeeded': False}}])[0]
                          .get('response_txn', {}).get('succeeded')):
-                on_success = fields['success'][0]
-                value = on_success.get('request_put')
-                delete = on_success.get('request_delete_range')
+                operations = fields['success']
             elif method == '/kv/put' and ret:
-                value = fields
+                operations = [{'request_put': fields}]
             elif method == '/kv/deleterange' and ret:
-                delete = fields
+                operations = [{'request_delete_range': fields}]
 
-            if value:
-                value['mod_revision'] = ret['header']['revision']
-                self._kv_cache.set(value)
-            elif delete and 'range_end' not in delete:
-                self._kv_cache.delete(delete['key'], ret['header']['revision'])
+            for operation in operations:
+                value = operation.get('request_put')
+                delete = operation.get('request_delete_range')
+                if value:
+                    value['mod_revision'] = ret['header']['revision']
+                    self._kv_cache.set(value)
+                elif delete and 'range_end' not in delete:
+                    self._kv_cache.delete(delete['key'], ret['header']['revision'])
 
         return ret
 
-    def txn(self, compare: Dict[str, Any], success: Dict[str, Any],
+    def txn(self, compare: Union[Dict[str, Any], List[Dict[str, Any]]],
+            success: Union[Dict[str, Any], List[Dict[str, Any]]],
             failure: Optional[Dict[str, Any]] = None, *, retry: Optional[Retry] = None) -> Dict[str, Any]:
         ret = super(PatroniEtcd3Client, self).txn(compare, success, failure, retry=retry)
         # Here we abuse the fact that the `failure` is only set in the call from update_leader().
@@ -1019,6 +1023,38 @@ class Etcd3(AbstractEtcd):
     @catch_etcd_errors
     def set_config_value(self, value: str, version: Optional[str] = None) -> bool:
         return bool(self._client.put(self.config_path, value, mod_revision=version))
+
+    @catch_etcd_errors
+    def set_maintenance_value(self, value: str, version: Optional[str] = None) -> bool:
+        return bool(self._client.put(self.maintenance_path, value, create_revision='0' if version is None else None,
+                                     mod_revision=version))
+
+    @staticmethod
+    def _put_with_compare(key: str, value: str, mod_revision: Optional[str],
+                          create_only: bool = False) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Build a put operation and the comparison that guards it, for a transaction that writes several keys.
+
+        :returns: the comparison, or ``None`` if the put is unconditional, and the operation.
+        """
+        fields = {'key': base64_encode(key), 'value': base64_encode(value)}
+        compare = None
+        if create_only:
+            compare = {'key': fields['key'], 'target': 'CREATE', 'create_revision': '0'}
+        elif mod_revision is not None:
+            compare = {'key': fields['key'], 'target': 'MOD', 'mod_revision': mod_revision}
+        return compare, {'request_put': fields}
+
+    @catch_etcd_errors
+    def _txn(self, compare: List[Dict[str, Any]], success: List[Dict[str, Any]]) -> bool:
+        return bool(self._client.txn(compare, success))
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[str],
+                                         maintenance: str, maintenance_version: Optional[str]) -> ConfigWrite:
+        compare1, put1 = self._put_with_compare(self.config_path, config, config_version)
+        compare2, put2 = self._put_with_compare(self.maintenance_path, maintenance, maintenance_version,
+                                                maintenance_version is None)
+        ret = self._txn([c for c in (compare1, compare2) if c], [put1, put2])
+        return ConfigWrite(ret, ret)
 
     @catch_etcd_errors
     def _write_leader_optime(self, last_lsn: str) -> bool:

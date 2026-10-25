@@ -391,6 +391,26 @@ class TestEtcd(unittest.TestCase):
         self.etcd.set_ttl(20)
         self.assertTrue(self.etcd.watch(None, 1))
 
+    def test_set_maintenance_value(self):
+        with patch.object(etcd.Client, 'write', Mock(return_value=True)) as mock_write:
+            self.assertTrue(self.etcd.set_maintenance_value('{}'))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevExist=False)
+            self.assertTrue(self.etcd.set_maintenance_value('{}', 5))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevIndex=5)
+        with patch.object(etcd.Client, 'write', Mock(side_effect=etcd.EtcdAlreadyExist)):
+            self.assertFalse(self.etcd.set_maintenance_value('{}'))
+
+    def test_set_config_and_maintenance_value(self):
+        with patch.object(etcd.Client, 'write', Mock(side_effect=[True, True, True, etcd.EtcdCompareFailed,
+                                                                  etcd.EtcdCompareFailed])) as mock_write:
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', 2), (True, True))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevIndex=2)
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', 2), (True, False))
+            # the mirror is not written when /config was not
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', None), (False, False))
+            self.assertEqual(mock_write.call_count, 5)
+            mock_write.assert_called_with(self.etcd.config_path, '{}', prevIndex=1)
+
     def test_sync_state(self):
         self.assertIsNone(self.etcd.write_sync_state('leader', None, 0))
         self.assertFalse(self.etcd.delete_sync_state())

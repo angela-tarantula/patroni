@@ -271,6 +271,33 @@ class TestRaft(unittest.TestCase):
         raft.watch(None, 0.001)
         raft._sync_obj.destroy()
 
+    def test_maintenance(self):
+        raft = get_dcs({'ttl': 30, 'scope': 'test', 'name': 'pg', 'retry_timeout': 10,
+                        'raft': {'self_addr': '127.0.0.1:1234', 'data_dir': self._TMP}})
+        self.assertTrue(raft.set_maintenance_value('{"pause":true}'))
+        self.assertFalse(raft.set_maintenance_value('{"pause":false}'))  # create only
+        maintenance = raft.get_cluster().maintenance
+        self.assertFalse(raft.set_maintenance_value('{"pause":false}', maintenance.version + 1))
+        # an unparsable value holds no decision but keeps its version, so a conditional write replaces it
+        self.assertTrue(raft.set_maintenance_value('{}', maintenance.version))
+        maintenance = raft.get_cluster().maintenance
+        self.assertIsNone(maintenance.pause)
+        self.assertTrue(raft.set_maintenance_value('{"pause":false}', maintenance.version))
+
+        # /config first, then the mirror only if /config was written
+        maintenance = raft.get_cluster().maintenance
+        self.assertEqual(raft.set_config_and_maintenance_value('{}', None, '{"pause":true}', maintenance.version),
+                         (True, True))
+        cluster = raft.get_cluster()
+        self.assertEqual(raft.set_config_and_maintenance_value('{"a":1}', cluster.config.version, '{}',
+                                                               cluster.maintenance.version + 1), (True, False))
+        self.assertEqual(raft.set_config_and_maintenance_value('{}', cluster.config.version, '{}', None),
+                         (False, False))
+        cluster = raft.get_cluster()
+        self.assertEqual(cluster.config.data, {'a': 1})
+        self.assertTrue(cluster.maintenance.pause)
+        raft._sync_obj.destroy()
+
     def tearDown(self):
         remove_files(os.path.join(self._TMP, '127.0.0.1:1234.'))
 
