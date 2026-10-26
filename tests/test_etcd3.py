@@ -141,6 +141,24 @@ class TestKVCache(BaseTestEtcd3):
             self.kv_cache._build_cache()
             mock_logger.info.assert_called_once_with('Watch request canceled')
 
+    def test_process_event_maintenance(self):
+        def event(path, value, mod_revision):
+            kv = {'key': base64_encode(path), 'mod_revision': mod_revision}
+            if value is None:
+                return {'type': 'DELETE', 'kv': kv}
+            return {'kv': {**kv, 'value': base64_encode(value)}}
+
+        path = self.etcd3.maintenance_path
+        for e, wakes in ((event(path, '{"pause":true}', '1'), True),  # created by the first write after a wipe
+                         (event(path, '{"pause":false}', '2'), True),
+                         (event(path, '{"pause":false}', '3'), False),  # value unchanged
+                         (event(path, None, '4'), True),
+                         (event('/patroni/test1/maintenance', '{"pause":true}', '5'), False),  # another group
+                         (event(self.etcd3.config_path, '{}', '6'), False)):  # creating /config still does not
+            self.etcd3.event.clear()
+            self.kv_cache._process_event(e)
+            self.assertEqual(self.etcd3.event.is_set(), wakes, e)
+
     def test__do_watch(self):
         self.client.watchprefix = Mock(return_value=False)
         self.assertRaises(AttributeError, self.kv_cache._do_watch, '1')

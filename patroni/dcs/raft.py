@@ -355,7 +355,7 @@ class Raft(AbstractDCS):
         if key == value['created'] == value['updated'] and \
                 (key.startswith(self.members_path) or key == self.leader_path and leader != self._name) or \
                 key in (self.leader_optime_path, self.status_path) and leader != self._name or \
-                key in (self.config_path, self.sync_path):
+                key in (self.config_path, self.maintenance_path, self.sync_path):
             self.event.set()
 
     def _on_delete(self, key: str) -> None:

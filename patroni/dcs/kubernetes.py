@@ -668,6 +668,15 @@ class ObjectCache(Thread):
             return logger.warning('Unexpected event type: %s', ev_type)
 
         if success and obj.get('kind') != 'Pod':
+            # The config object also carries the mirror, which wakes the loop on any change, including creation.
+            if name == self._dcs.config_path:
+                maintenance = getattr(self._dcs, '_MAINTENANCE')  # pyright: ignore
+                old_maintenance = old_value and (old_value.metadata.annotations or EMPTY_DICT).get(maintenance)
+                new_maintenance = None if ev_type == 'DELETED' \
+                    else (obj.metadata.annotations or EMPTY_DICT).get(maintenance)
+                if old_maintenance != new_maintenance:
+                    logger.debug('%s %s changed from %s to %s', name, maintenance, old_maintenance, new_maintenance)
+                    self._dcs.event.set()
             if old_value:
                 old_value = (old_value.metadata.annotations or EMPTY_DICT).get(self._annotations_map.get(name, ''))
 
