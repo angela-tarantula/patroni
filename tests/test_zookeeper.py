@@ -373,6 +373,31 @@ class TestZooKeeper(unittest.TestCase):
     def test_set_history_value(self):
         self.zk.set_history_value('{}')
 
+    def test_maintenance_watch(self):
+        with patch.object(self.zk, 'get_node', Mock(side_effect=self.zk.get_node)) as mock_get_node:
+            self.zk.get_cluster()
+            mock_get_node.assert_any_call('/service/test/maintenance', watch=self.zk._watcher)
+
+        # absent: watched with exists(), which wakes the loop if the node was created in the meantime
+        self.zk._base_path = '/service/bla'
+        with patch.object(MockKazooClient, 'exists', Mock(return_value=None)) as mock_exists:
+            self.zk.event.clear()
+            self.zk.get_cluster()
+            mock_exists.assert_called_once_with('/service/bla/maintenance', watch=self.zk._watcher)
+            self.assertFalse(self.zk.event.is_set())
+            mock_exists.return_value = ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            self.zk.get_cluster()
+            self.assertTrue(self.zk.event.is_set())
+
+        # other groups are loaded without a watch
+        self.zk._base_path = '/service/test'
+        self.zk._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
+        with patch.object(self.zk, 'get_node', Mock(side_effect=self.zk.get_node)) as mock_get_node, \
+                patch.object(MockKazooClient, 'exists', Mock(return_value=None)) as mock_exists:
+            self.zk.get_cluster()
+            mock_get_node.assert_any_call('/service/test/1/maintenance', watch=None)
+            mock_exists.assert_called_once_with('/service/test/0/maintenance', watch=self.zk._watcher)
+
     def test_watcher(self):
         self.zk._watcher(WatchedEvent('', '', ''))
         self.assertTrue(self.zk.watch(1, 1))

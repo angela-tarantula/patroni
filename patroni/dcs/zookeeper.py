@@ -240,8 +240,13 @@ class ZooKeeper(AbstractDCS):
         config = self.get_node(path + self._CONFIG, watch=self._watcher) if self._CONFIG in nodes else None
         config = config and ClusterConfig.from_node(config[1].version, config[0], config[1].mzxid)
 
-        # get the maintenance key
-        maintenance = self.get_node(path + self._MAINTENANCE) if self._MAINTENANCE in nodes else None
+        # get the maintenance key, watching it only for our own group
+        watch = self._watcher if path == self.client_path('') else None
+        maintenance = self.get_node(path + self._MAINTENANCE, watch=watch) if self._MAINTENANCE in nodes else None
+        # A watch set through get() needs the node to exist, but the first pause or resume after a wipe creates it.
+        # If it was created after get_children() returned, exists() finds it and the loop wakes up at once.
+        if maintenance is None and watch and self._client.exists(path + self._MAINTENANCE, watch=watch):
+            self.event.set()
         maintenance = maintenance and ClusterMaintenance.from_node(maintenance[1].version, maintenance[0])
 
         # get timeline history

@@ -534,6 +534,7 @@ class KVCache(StaleEtcdNodeGuard, Thread):
         self._client = client
         self.condition = Condition()
         self._config_key = base64_encode(dcs.config_path)
+        self._maintenance_key = base64_encode(dcs.maintenance_path)
         self._leader_key = base64_encode(dcs.leader_path)
         self._optime_key = base64_encode(dcs.leader_optime_path)
         self._status_key = base64_encode(dcs.status_path)
@@ -582,8 +583,10 @@ class KVCache(StaleEtcdNodeGuard, Thread):
             old_value = old_value and old_value.get('value')
             new_value = kv.get('value')
 
+            # The mirror is created by the first pause or resume after a wipe, so its creation counts too.
             value_changed = old_value != new_value and \
-                (key == self._leader_key or key in (self._optime_key, self._status_key) and new_value is not None
+                (key in (self._leader_key, self._maintenance_key)
+                 or key in (self._optime_key, self._status_key) and new_value is not None
                  or key == self._config_key and old_value is not None and new_value is not None)
 
             if value_changed:

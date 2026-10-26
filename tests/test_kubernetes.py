@@ -636,6 +636,24 @@ class TestCacheBuilder(BaseTestKubernetes):
         ) + '\n').encode('utf-8'), b'{"object":{', b'"code":410}}\n']
         self.k._kinds._build_cache()
 
+    def test_process_event_maintenance(self):
+        def event(resource_version, maintenance, name=None, ev_type='MODIFIED'):
+            annotations = {'initialize': '123', 'config': '{}', 'history': '{}'}
+            if maintenance is not None:
+                annotations['maintenance'] = maintenance
+            return {'type': ev_type, 'object': {'metadata': {
+                'name': name or self.k.config_path, 'resourceVersion': resource_version, 'annotations': annotations}}}
+
+        for e, wakes in ((event('2', '{"pause": true}'), False),  # value unchanged
+                         (event('3', '{"pause": false}'), True),
+                         (event('4', None), True),
+                         (event('5', '{"pause": true}'), True),  # created by the first write after a wipe
+                         (event('6', None, ev_type='DELETED'), True),
+                         (event('7', '{"pause": true}', name='test-1-config', ev_type='ADDED'), False)):
+            self.k.event.clear()
+            self.k._kinds._process_event(e)
+            self.assertEqual(self.k.event.is_set(), wakes, e)
+
     @patch('patroni.dcs.kubernetes.logger.error', Mock(side_effect=SleepException))
     @patch('patroni.dcs.kubernetes.ObjectCache._build_cache', Mock(side_effect=Exception))
     def test_run(self):
