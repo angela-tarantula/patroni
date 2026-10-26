@@ -284,6 +284,22 @@ class Ha(object):
         """:returns: `True` if in maintenance mode."""
         return global_config.is_paused
 
+    def _dynamic_configuration_to_restore(self) -> str:
+        """Serialize the cached dynamic configuration for writing to a missing or empty ``/config``.
+
+        .. note::
+            ``pause`` is set to the value this node currently acts on rather than copied from the cache. While
+            ``/config`` is missing that is the decision recorded in the ``/maintenance`` key, so a pause or resume
+            made after the DCS lost ``/config`` is not undone by restoring an older value from the cache.
+
+        :returns: the cached dynamic configuration with ``pause`` replaced, serialized to JSON.
+        """
+        configuration = self.patroni.config.dynamic_configuration
+        configuration.pop('pause', None)
+        if self.is_paused():
+            configuration['pause'] = True
+        return json.dumps(configuration, separators=(',', ':'))
+
     def check_timeline(self) -> bool:
         """:returns: `True` if should check whether the timeline is latest during the leader race."""
         return global_config.check_mode('check_timeline')
@@ -2258,7 +2274,7 @@ class Ha(object):
 
         self._rewind.ensure_checkpoint_after_promote(self.wakeup)
         self.dcs.initialize(create_new=(self.cluster.initialize is None), sysid=self.state_handler.sysid)
-        self.dcs.set_config_value(json.dumps(self.patroni.config.dynamic_configuration, separators=(',', ':')))
+        self.dcs.set_config_value(self._dynamic_configuration_to_restore())
         self.dcs.take_leader()
         self.set_is_leader(True)
         if self.is_synchronous_mode():
@@ -2352,7 +2368,7 @@ class Ha(object):
                 self.dcs.initialize(create_new=(self.cluster.initialize is None), sysid=self.state_handler.sysid)
 
             if self.has_lock(False) and not (self.cluster.config and self.cluster.config.data):
-                self.dcs.set_config_value(json.dumps(self.patroni.config.dynamic_configuration, separators=(',', ':')))
+                self.dcs.set_config_value(self._dynamic_configuration_to_restore())
                 self.cluster = self.dcs.get_cluster()
 
             if self._async_executor.busy:
