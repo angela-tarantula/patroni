@@ -14,7 +14,8 @@ from . import global_config, psycopg, thread_pool
 from .__main__ import Patroni
 from .async_executor import AsyncExecutor, CriticalTask
 from .collections import CaseInsensitiveSet
-from .dcs import AbstractDCS, Cluster, Leader, Member, RemoteMember, Status, SyncState
+from .dcs import AbstractDCS, Cluster, config_is_paused, Leader, \
+    maintenance_value, Member, RemoteMember, Status, SyncState
 from .exceptions import DCSError, PatroniFatalException, PostgresConnectionException
 from .postgresql.callback_executor import CallbackAction
 from .postgresql.misc import postgres_version_to_int, PostgresqlRole, PostgresqlState
@@ -299,6 +300,26 @@ class Ha(object):
         if self.is_paused():
             configuration['pause'] = True
         return json.dumps(configuration, separators=(',', ':'))
+
+    def _update_pause_copy(self) -> None:
+        """Make the ``/maintenance`` key match ``pause`` in ``/config``, the key that decides it.
+
+        .. note::
+            The ``/maintenance`` key falls behind ``/config`` when a write of it failed, when ``pause`` was written
+            into ``/config`` directly, and in a cluster upgraded from a release without the key. The leader-lock
+            holder keeps it in step, or every member while there is no leader: the write is conditional, so members
+            writing at the same time converge on one write.
+        """
+        if not (self.has_lock(False) or self.cluster.is_unlocked()):
+            return
+        config = self.cluster.config
+        if not (config and config.modify_version):
+            return  # the /maintenance key decides, and the restore rebuilds /config from it
+        decision, copy = config_is_paused(config.data), self.cluster.maintenance
+        if copy and copy.pause == decision:
+            return
+        if self.dcs.set_maintenance_value(maintenance_value(copy, decision), copy and copy.version):
+            logger.info('Updated pause in the /maintenance key to %s to match /config', decision)
 
     def check_timeline(self) -> bool:
         """:returns: `True` if should check whether the timeline is latest during the leader race."""
@@ -2370,6 +2391,8 @@ class Ha(object):
             if self.has_lock(False) and not (self.cluster.config and self.cluster.config.data):
                 self.dcs.set_config_value(self._dynamic_configuration_to_restore())
                 self.cluster = self.dcs.get_cluster()
+
+            self._update_pause_copy()
 
             if self._async_executor.busy:
                 return self.handle_long_action_in_progress()
