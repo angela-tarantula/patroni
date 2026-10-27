@@ -45,7 +45,7 @@ Patroni keeps the pause decision in the ``/config`` key in DCS, ``{namespace}/{c
 
 While ``/config`` exists, it decides the pause state. When it is missing, a ``PATCH /config`` REST API request containing only ``pause`` records the decision in the maintenance key without creating ``/config``. Nodes follow that decision, and Patroni carries it into a rebuilt ``/config``. If neither DCS key holds a decision, each running Patroni node keeps its last known pause state. While ``/config`` exists, ``patronictl`` and the REST API keep the maintenance key in step whenever a write changes the resulting pause state.
 
-Tools that write ``pause`` into ``/config`` directly in the DCS should use ``patronictl`` or the REST API instead. Where that is not possible, they should update the maintenance key as well, following these rules:
+Tools that write ``pause`` directly to ``/config`` in the DCS keep working: Patroni copies the change to the maintenance key within one HA loop. To keep the maintenance key from falling behind ``/config``, change ``pause`` through ``patronictl`` or the REST API, or write the maintenance key as well, following these rules:
 
 - A change takes effect once ``/config`` holds it; writing the maintenance key too keeps it in force if ``/config`` is lost.
 - Write each key conditionally on the version you read. If a write fails, reload and redo the change on what you read, rather than resending values computed from the earlier read, which could undo a change made in between.
