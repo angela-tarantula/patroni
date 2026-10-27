@@ -34,4 +34,20 @@ User guide
 
 ``patronictl`` supports :ref:`pause <patronictl_pause>` and :ref:`resume <patronictl_resume>` commands.
 
-One can also issue a ``PATCH`` request to the ``{namespace}/{cluster}/config`` key with ``{"pause": true/false/null}``
+One can also issue a ``PATCH /config`` request to the Patroni :ref:`REST API <config_endpoint>` with ``{"pause": true/false/null}``.
+
+.. _pause_maintenance_key:
+
+The maintenance key
+-------------------
+
+Patroni keeps the pause decision in the ``/config`` key in DCS, ``{namespace}/{cluster}/config``, which holds the dynamic configuration. It mirrors the decision in the maintenance key, ``{namespace}/{cluster}/maintenance``, so that a cluster can still be paused or resumed after the DCS has lost its data. On Kubernetes these are the ``config`` and ``maintenance`` annotations of the ``{cluster}-config`` object. The maintenance key contains a JSON object such as ``{"pause": true}``, which may contain other fields.
+
+While ``/config`` exists, it decides the pause state. When it is missing, a ``PATCH /config`` REST API request containing only ``pause`` records the decision in the maintenance key without creating ``/config``. Nodes follow that decision, and Patroni carries it into a rebuilt ``/config``. If neither DCS key holds a decision, each running Patroni node keeps its last known pause state. While ``/config`` exists, ``patronictl`` and the REST API keep the maintenance key in step whenever a write changes the resulting pause state.
+
+Tools that write ``pause`` into ``/config`` directly in the DCS should use ``patronictl`` or the REST API instead. Where that is not possible, they should update the maintenance key as well, following these rules:
+
+- A change takes effect once ``/config`` holds it; writing the maintenance key too keeps it in force if ``/config`` is lost.
+- Write each key conditionally on the version you read. If a write fails, reload and redo the change on what you read, rather than resending values computed from the earlier read, which could undo a change made in between.
+- Change only ``pause`` in the maintenance key, and keep its other fields.
+- On Kubernetes, write both annotations in one patch. They share the object's resource version, so after one patch succeeds, a second patch conditional on the first version read before it would fail.

@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover
 
 from . import global_config
 from .config import Config
-from .dcs import AbstractDCS, Cluster, get_dcs as _get_dcs, Leader, Member
+from .dcs import AbstractDCS, Cluster, get_dcs as _get_dcs, Leader, Member, write_config
 from .exceptions import PatroniException
 from .postgresql.misc import postgres_version_to_int, PostgresqlRole, PostgresqlState
 from .postgresql.mpp import get_mpp
@@ -2244,8 +2244,13 @@ def edit_config(cluster_name: str, group: Optional[int], force: bool, quiet: boo
         return
 
     if force or click.confirm('Apply these changes?'):
-        if not dcs.set_config_value(json.dumps(changed_data, separators=(',', ':')), cluster.config.version):
+        # A /config that is not valid does not decide pause, so the /maintenance key is written whatever it held.
+        config_before = cluster.config.data if cluster.config.modify_version else None
+        ret = write_config(dcs, cluster.config.version, cluster.maintenance, config_before, changed_data)
+        if not ret.config:
             raise PatroniCtlException("Config modification aborted due to concurrent changes")
+        if not ret.maintenance:
+            click.echo('Failed to update the maintenance key; the configuration remains authoritative')
         click.echo("Configuration changed")
 
 

@@ -631,6 +631,17 @@ If you want to remove (reset) some setting just patch it with ``null``:
 
 The above call removes ``postgresql.parameters.max_connections`` from the dynamic configuration.
 
+While the dynamic configuration is missing from the DCS, for example after the DCS lost its data, a ``PATCH /config`` that contains only ``pause`` records the decision in the :ref:`maintenance key <pause_maintenance_key>` and returns it. Any other ``PATCH /config`` returns HTTP status code **503**.
+
+.. code-block:: bash
+
+  $ curl -s -XPATCH -d '{"pause":null}' http://localhost:8008/config | jq .
+  {
+    "pause": false
+  }
+
+A ``PATCH /config`` whose conditional write loses to a concurrent change returns HTTP status code **409** and changes nothing.
+
 ``PUT /config``: It's also possible to perform the full rewrite of an existing dynamic configuration unconditionally:
 
 .. code-block:: bash
@@ -654,6 +665,8 @@ The above call removes ``postgresql.parameters.max_connections`` from the dynami
 	  },
 	  "loop_wait": 3
 	}
+
+``PUT /config`` remains an unconditional replacement. To keep it so while updating the :ref:`maintenance key <pause_maintenance_key>` consistently, Patroni may retry it internally after a concurrent change or a transient DCS failure, so sustained contention or unavailability delays the HTTP status code **502** response until ``retry_timeout`` has passed.
 
 
 Switchover and failover endpoints
