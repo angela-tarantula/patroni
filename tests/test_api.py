@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch, PropertyMock
 
 from patroni import global_config
 from patroni.api import RestApiHandler, RestApiServer
-from patroni.dcs import ClusterConfig, Member
+from patroni.dcs import Cluster, ClusterConfig, ClusterMaintenance, ConfigWrite, Member
 from patroni.exceptions import PostgresConnectionException
 from patroni.ha import _MemberStatus
 from patroni.postgresql.config import get_param_diff
@@ -488,6 +488,166 @@ class TestRestApiHandler(unittest.TestCase):
         MockRestApiServer(RestApiHandler, request)
         mock_dcs.get_cluster.return_value.config = ClusterConfig.from_node(1, config)
         MockRestApiServer(RestApiHandler, request)
+
+    def _config_request(self, method, body):
+        body = json.dumps(body)
+        return '{} /config HTTP/1.0{}\nContent-Length: {}\n\n{}'.format(
+            method, self._authorization, len(body), body)
+
+    @staticmethod
+    def _cluster(config, maintenance):
+        cluster = get_cluster_initialized_without_leader()
+        return Cluster(cluster.initialize, config, *cluster[2:10], maintenance)
+
+    @patch.object(MockPatroni, 'dcs')
+    def test_do_PATCH_config_pause(self, mock_dcs):
+        valid = ClusterConfig(1, {'ttl': 30}, 1)
+        paused = ClusterConfig(1, {'ttl': 30, 'pause': True}, 1)
+        not_valid = ClusterConfig(1, {}, 0)  # how an unparsable /config, or a Kubernetes object without one, loads
+        mirror = ClusterMaintenance(2, {'pause': False, 'x': 1})
+        no_decision = ClusterMaintenance(4, {})  # how an unparsable mirror loads
+        mock_dcs.set_config_and_maintenance_value.return_value = ConfigWrite(True, True)
+        both = ('set_config_and_maintenance_value', '{"ttl":30,"pause":true}', 1, '{"pause":true,"x":1}', 2)
+        # /config, mirror, request -> the one write expected, the error returned without writing, or None if the
+        # request changes nothing and succeeds without writing
+        for config, maintenance, request, expected in (
+                (valid, mirror, {'pause': True}, both),
+                (paused, mirror, {'pause': None},
+                 ('set_config_and_maintenance_value', '{"ttl":30}', 1, '{"pause":false,"x":1}', 2)),
+                (paused, mirror, {'pause': True}, None),
+                (valid, None, {'pause': True},  # a cluster upgraded to this release has no mirror yet
+                 ('set_config_and_maintenance_value', '{"ttl":30,"pause":true}', 1, '{"pause":true}', None)),
+                (valid, mirror, {'pause': True, 'ttl': 20},
+                 ('set_config_and_maintenance_value', '{"ttl":20,"pause":true}', 1, '{"pause":true,"x":1}', 2)),
+                (valid, mirror, {'ttl': 20}, ('set_config_value', '{"ttl":20}', 1)),
+                (None, mirror, {'pause': True}, ('set_maintenance_value', '{"pause":true,"x":1}', 2)),
+                (None, None, {'pause': None}, ('set_maintenance_value', '{"pause":false}', None)),
+                (None, mirror, {'pause': True, 'ttl': 20}, 503),
+                (None, mirror, {'ttl': 20}, 503),
+                (None, no_decision, {'pause': True}, ('set_maintenance_value', '{"pause":true}', 4)),
+                (not_valid, mirror, {'pause': True}, ('set_maintenance_value', '{"pause":true,"x":1}', 2)),
+                (not_valid, mirror, {'pause': True, 'ttl': 20}, 503),
+                (not_valid, mirror, {'ttl': 20}, 503)):
+            with self.subTest(config=config, maintenance=maintenance, request=request):
+                mock_dcs.reset_mock()
+                mock_dcs.get_cluster.return_value = self._cluster(config, maintenance)
+                with patch.object(RestApiHandler, 'send_error') as mock_send_error:
+                    MockRestApiServer(RestApiHandler, self._config_request('PATCH', request))
+                writes = [(name,) + args for name, args, _ in mock_dcs.method_calls if name.startswith('set_')]
+                if isinstance(expected, int):
+                    mock_send_error.assert_called_once_with(expected)
+                    self.assertEqual(writes, [])
+                else:
+                    mock_send_error.assert_not_called()
+                    self.assertEqual(writes, [expected] if expected else [])
+
+        # while /config is missing, the response carries the recorded decision, and the node's own HA loop is woken,
+        # because on some backends a node's own write does not wake it
+        mock_dcs.get_cluster.return_value = self._cluster(None, None)
+        with patch.object(RestApiHandler, 'write_response') as mock_response, \
+                patch.object(MockHa, 'wakeup') as mock_wakeup:
+            MockRestApiServer(RestApiHandler, self._config_request('PATCH', {'pause': None}))
+        mock_response.assert_called_once_with(200, '{"pause": false}', content_type='application/json')
+        mock_wakeup.assert_called_once()
+
+    @patch.object(MockPatroni, 'dcs')
+    def test_do_PATCH_config_pause_write_fails(self, mock_dcs):
+        valid = self._cluster(ClusterConfig(1, {'ttl': 30}, 1), None)
+        with patch.object(RestApiHandler, 'send_error') as mock_send_error:
+            # while /config is missing nothing was recorded
+            mock_dcs.get_cluster.return_value = self._cluster(None, None)
+            mock_dcs.set_maintenance_value.return_value = False
+            with patch.object(MockHa, 'wakeup') as mock_wakeup:
+                MockRestApiServer(RestApiHandler, self._config_request('PATCH', {'pause': True}))
+            mock_send_error.assert_called_once_with(409)
+            mock_wakeup.assert_not_called()
+
+            mock_send_error.reset_mock()
+            mock_dcs.get_cluster.return_value = valid
+            mock_dcs.set_config_and_maintenance_value.return_value = ConfigWrite(False, False)
+            MockRestApiServer(RestApiHandler, self._config_request('PATCH', {'pause': True}))
+            mock_send_error.assert_called_once_with(409)
+
+            mock_send_error.reset_mock()
+            mock_dcs.set_config_value.return_value = False
+            MockRestApiServer(RestApiHandler, self._config_request('PATCH', {'ttl': 20}))
+            mock_send_error.assert_called_once_with(409)
+
+        # where the keys are written one after the other, /config decides even if the mirror write failed
+        mock_dcs.set_config_and_maintenance_value.return_value = ConfigWrite(True, False)
+        with patch.object(RestApiHandler, 'write_response') as mock_response, \
+                patch('patroni.api.logger.warning') as mock_warning:
+            MockRestApiServer(RestApiHandler, self._config_request('PATCH', {'pause': True}))
+        self.assertEqual(mock_response.call_args[0][0], 200)
+        mock_warning.assert_called_once()
+
+    @patch('time.sleep', Mock())
+    @patch.object(MockPatroni, 'dcs')
+    def test_do_PUT_config_pause(self, mock_dcs):
+        resumed = ClusterConfig(1, {'ttl': 30}, 1)
+        paused = ClusterConfig(2, {'ttl': 30, 'pause': True}, 2)
+        conflict, written = ConfigWrite(False, False), ConfigWrite(True, True)
+        both = 'set_config_and_maintenance_value'
+        # the state each attempt reads, what the config-only and the combined writes return, and the writes made
+        for case, clusters, config_results, both_results, expected in (
+                ('pause unchanged: /config alone, conditional on its version',
+                 [self._cluster(resumed, None)], [True], [],
+                 [('set_config_value', '{"ttl":20}', 1)]),
+                ('a pause lands before the write, which then has to resume the cluster',
+                 [self._cluster(resumed, ClusterMaintenance(4, {'pause': False, 'x': 1})),
+                  self._cluster(paused, ClusterMaintenance(5, {'pause': True, 'x': 1}))], [False], [written],
+                 [('set_config_value', '{"ttl":20}', 1), (both, '{"ttl":20}', 2, '{"pause":false,"x":1}', 5)]),
+                ('a resume lands before the write, which then leaves pause alone',
+                 [self._cluster(paused, ClusterMaintenance(5, {'pause': True})),
+                  self._cluster(ClusterConfig(3, {'ttl': 30}, 3), ClusterMaintenance(6, {'pause': False}))],
+                 [True], [conflict],
+                 [(both, '{"ttl":20}', 2, '{"pause":false}', 5), ('set_config_value', '{"ttl":20}', 3)]),
+                ('/config missing: both keys, guarded by the version of the mirror',
+                 [self._cluster(None, ClusterMaintenance(6, {'pause': True}))], [], [written],
+                 [(both, '{"ttl":20}', None, '{"pause":false}', 6)]),
+                ('/config missing and a concurrent pause creates the mirror first',
+                 [self._cluster(None, None), self._cluster(None, ClusterMaintenance(7, {'pause': True}))],
+                 [], [conflict, written],
+                 [(both, '{"ttl":20}', None, '{"pause":false}', None),
+                  (both, '{"ttl":20}', None, '{"pause":false}', 7)]),
+                ('/config missing and a concurrent resume rewrites the mirror first',
+                 [self._cluster(None, ClusterMaintenance(6, {'pause': True})),
+                  self._cluster(None, ClusterMaintenance(7, {'pause': False}))], [], [conflict, written],
+                 [(both, '{"ttl":20}', None, '{"pause":false}', 6), (both, '{"ttl":20}', None, '{"pause":false}', 7)]),
+                ('/config missing and a mirror without a decision: guarded by its version, not created',
+                 [self._cluster(None, ClusterMaintenance(8, {}))], [], [written],
+                 [(both, '{"ttl":20}', None, '{"pause":false}', 8)]),
+                ('/config present but not valid: written as if missing, guarded by the version of the mirror',
+                 [self._cluster(ClusterConfig(1, {}, 0), ClusterMaintenance(9, {'pause': True}))], [], [written],
+                 [(both, '{"ttl":20}', None, '{"pause":false}', 9)])):
+            with self.subTest(case=case):
+                mock_dcs.reset_mock()
+                mock_dcs.get_cluster.side_effect = clusters
+                mock_dcs.set_config_value.side_effect = config_results
+                mock_dcs.set_config_and_maintenance_value.side_effect = both_results
+                with patch.object(RestApiHandler, 'write_response') as mock_response:
+                    MockRestApiServer(RestApiHandler, self._config_request('PUT', {'ttl': 20}))
+                self.assertEqual(mock_response.call_args[0][0], 200)
+                self.assertEqual([(name,) + args for name, args, _ in mock_dcs.method_calls
+                                  if name.startswith('set_')], expected)
+
+        # where the keys are written one after the other, a failed mirror write after /config landed is not retried
+        mock_dcs.reset_mock()
+        mock_dcs.get_cluster.side_effect = None
+        mock_dcs.get_cluster.return_value = self._cluster(paused, None)
+        mock_dcs.set_config_and_maintenance_value.side_effect = None
+        mock_dcs.set_config_and_maintenance_value.return_value = ConfigWrite(True, False)
+        with patch.object(RestApiHandler, 'write_response') as mock_response:
+            MockRestApiServer(RestApiHandler, self._config_request('PUT', {'ttl': 20}))
+        self.assertEqual(mock_response.call_args[0][0], 200)
+        mock_dcs.set_config_and_maintenance_value.assert_called_once()
+
+        # a write that keeps losing gives up once retry_timeout passes
+        mock_dcs.set_config_and_maintenance_value.return_value = conflict
+        with patch.object(global_config.__class__, 'get_int', Mock(return_value=0)), \
+                patch.object(RestApiHandler, 'send_error') as mock_send_error:
+            MockRestApiServer(RestApiHandler, self._config_request('PUT', {'ttl': 20}))
+        mock_send_error.assert_called_once_with(502)
 
     @patch.object(MockPatroni, 'dcs')
     def test_do_GET_failsafe(self, mock_dcs):

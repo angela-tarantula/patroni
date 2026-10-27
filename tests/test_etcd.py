@@ -9,7 +9,7 @@ import urllib3.util.connection
 from dns.exception import DNSException
 from urllib3.exceptions import ReadTimeoutError
 
-from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, ConfigWrite, get_dcs, write_config
 from patroni.dcs.etcd import AbstractDCS, Cluster, DnsCachingResolver, Etcd, EtcdClient, EtcdError
 from patroni.exceptions import DCSError
 from patroni.postgresql.mpp import get_mpp
@@ -410,6 +410,31 @@ class TestEtcd(unittest.TestCase):
             self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', None), (False, False))
             self.assertEqual(mock_write.call_count, 5)
             mock_write.assert_called_with(self.etcd.config_path, '{}', prevIndex=1)
+
+    def test_write_config(self):
+        # write_config() is backend-independent; Etcd only supplies a concrete DCS whose two write methods are patched
+        mirror = ClusterMaintenance(4, {'pause': True, 'x': 1})
+        both = 'set_config_and_maintenance_value'
+        # config before, config after, what the config-only and the combined writes return -> the writes made and the
+        # result
+        for before, after, config_written, both_written, writes, result in (
+                ({'pause': True}, {'pause': True, 'ttl': 20}, True, None,
+                 [('set_config_value', '{"pause":true,"ttl":20}', 3)], (True, True)),
+                ({'pause': True}, {'ttl': 20}, None, ConfigWrite(True, True),
+                 [(both, '{"ttl":20}', 3, '{"pause":false,"x":1}', 4)], (True, True)),
+                # where the keys are written one after the other, a failed mirror write is passed on to the caller
+                ({'pause': True}, {'ttl': 20}, None, ConfigWrite(True, False),
+                 [(both, '{"ttl":20}', 3, '{"pause":false,"x":1}', 4)], (True, False)),
+                (None, {'pause': True}, None, ConfigWrite(True, True),  # /config did not decide pause
+                 [(both, '{"pause":true}', 3, '{"pause":true,"x":1}', 4)], (True, True)),
+                ({}, {'ttl': 20}, False, None, [('set_config_value', '{"ttl":20}', 3)], (False, False))):
+            with self.subTest(before=before, after=after, config_written=config_written, both_written=both_written):
+                with patch.object(Etcd, 'set_config_value', Mock(return_value=config_written)) as mock_set, \
+                        patch.object(Etcd, both, Mock(return_value=both_written)) as mock_both:
+                    self.assertEqual(write_config(self.etcd, 3, mirror, before, after), result)
+                    made = [('set_config_value',) + c[0] for c in mock_set.call_args_list] + \
+                           [(both,) + c[0] for c in mock_both.call_args_list]
+                    self.assertEqual(made, writes)
 
     def test_sync_state(self):
         self.assertIsNone(self.etcd.write_sync_state('leader', None, 0))
