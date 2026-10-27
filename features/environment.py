@@ -749,6 +749,30 @@ class ZooKeeperController(AbstractExternalDcsController):
         except Exception as e:
             assert False, "exception when cleaning up zookeeper contents: {0}".format(e)
 
+    def wipe(self):
+        import kazoo.exceptions
+
+        # Delete the whole tree in one transaction, as the other DCSs delete it in one request. Deleting nodes one at
+        # a time fires the watches that running members keep on them, and they re-create their nodes before the walk
+        # reaches the parent. A member can still write between the listing and the commit, so repeat until it lands.
+        path = self.path(scope='').rstrip('/')
+        attempts = 10
+        for _ in range(attempts):
+            nodes = [path]
+            for node in nodes:  # breadth first, so that reversed() deletes children before their parents
+                try:
+                    nodes.extend(node + '/' + child for child in self._client.get_children(node))
+                except kazoo.exceptions.NoNodeError:
+                    pass
+            transaction = self._client.transaction()
+            for node in reversed(nodes):
+                transaction.delete(node)
+            if not any(isinstance(result, Exception) for result in transaction.commit()) \
+                    or not self._client.exists(path):
+                break
+        else:
+            assert False, "could not wipe {0} after {1} attempts".format(path, attempts)
+
     def _is_running(self):
         if not super(ZooKeeperController, self)._is_running():
             return False
