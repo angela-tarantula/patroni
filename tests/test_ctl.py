@@ -679,6 +679,33 @@ class TestCtl(unittest.TestCase):
             result = self.runner.invoke(ctl, ['resume', 'dummy'])
             assert 'Can not find accessible cluster member' in result.output
 
+    @patch('patroni.ctl.request_patroni')
+    def test_pause_resume_guard(self, mock_request):
+        mock_request.return_value.status = 200
+        cluster = get_cluster_initialized_with_leader()
+        # /config, mirror -> the decision the DCS holds, or None if it holds none
+        for config, maintenance, decision in (
+                (ClusterConfig(1, {'pause': True}, 1), None, True),
+                (ClusterConfig(1, {}, 1), ClusterMaintenance(2, {'pause': True}), False),  # /config decides
+                (None, ClusterMaintenance(2, {'pause': True}), True),
+                (None, ClusterMaintenance(2, {'pause': False}), False),
+                (ClusterConfig(1, {}, 0), ClusterMaintenance(2, {'pause': True}), True),  # /config not valid
+                (None, ClusterMaintenance(2, {}), None),  # a mirror whose value can not be parsed
+                (None, None, None)):
+            for command, paused in (('pause', True), ('resume', False)):
+                with self.subTest(config=config, maintenance=maintenance, command=command):
+                    mock_request.reset_mock()
+                    with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=Cluster(
+                            cluster.initialize, config, *cluster[2:10], maintenance))):
+                        result = self.runner.invoke(ctl, [command, 'dummy'])
+                    if decision == paused:
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertIn('Cluster is already paused' if paused else 'Cluster is not paused', result.output)
+                        mock_request.assert_not_called()
+                    else:
+                        self.assertEqual(result.exit_code, 0)
+                        self.assertEqual(mock_request.call_args[0][1:], ('patch', 'config', {'pause': paused or None}))
+
     def test_apply_config_changes(self):
         config = {"postgresql": {"parameters": {"work_mem": "4MB"}, "use_pg_rewind": True}, "ttl": 30}
 
