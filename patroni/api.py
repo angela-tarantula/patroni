@@ -27,7 +27,7 @@ import dateutil.parser
 
 from . import global_config, psycopg
 from .__main__ import Patroni
-from .dcs import Cluster
+from .dcs import Cluster, config_is_paused, maintenance_value, write_config
 from .exceptions import PostgresConnectionException, PostgresException
 from .postgresql.misc import postgres_version_to_int, PostgresqlRole, PostgresqlState
 from .thread_pool import PatroniThreadPoolExecutor
@@ -35,6 +35,10 @@ from .utils import cluster_as_json, deep_compare, enable_keepalive, parse_bool, 
     parse_int, patch_config, Retry, RetryFailedError, split_host_port, tzutc, uri
 
 logger = logging.getLogger(__name__)
+
+
+class _ConfigWriteConflict(Exception):
+    """Raised when an attempt to write ``/config`` failed, normally because it lost to a concurrent change."""
 
 
 def check_access(*args: Any, **kwargs: Any) -> Callable[..., Any]:
@@ -814,28 +818,59 @@ class RestApiHandler(BaseHTTPRequestHandler):
             logger.exception('Bad request')
         self.send_error(400)
 
+    def _write_config(self, cluster: Cluster, version: Optional[Any],
+                      config_before: Optional[Dict[str, Any]], config_after: Dict[str, Any]) -> bool:
+        """Write ``/config``, together with the ``/maintenance`` key if ``pause`` changes.
+
+        .. note::
+            Where the two keys can not be written in one atomic operation, a failed write of the ``/maintenance`` key
+            is logged and ignored: ``/config`` has been written and remains authoritative for ``pause``.
+
+        :param cluster: the cluster state the write is based on.
+        :param version: as *version* of :meth:`~patroni.dcs.AbstractDCS.set_config_value`.
+        :param config_before: as *config_before* of :func:`~patroni.dcs.write_config`.
+        :param config_after: the new configuration.
+
+        :returns: ``True`` if ``/config`` was written.
+        """
+        ret = write_config(self.server.patroni.dcs, version, cluster.maintenance, config_before, config_after)
+        if ret.config and not ret.maintenance:
+            logger.warning('Failed to update the /maintenance key after /config was updated; '
+                           '/config remains authoritative')
+        return ret.config
+
     @check_access
     def do_PATCH_config(self) -> None:
         """Handle a ``PATCH`` request to ``/config`` path.
 
         Updates the Patroni configuration based on the JSON request body, then writes a response with the new
-        configuration, with HTTP status ``200``.
+        configuration, with HTTP status ``200``. A request that changes ``pause`` also records it in the
+        ``/maintenance`` key.
 
         .. note::
-            If the configuration has been previously wiped out from DCS, then write a response with
-            HTTP status ``503``.
+            If the configuration has been previously wiped out from DCS, then a request that contains only ``pause``
+            records it in the ``/maintenance`` key and gets a response with the recorded value and HTTP status
+            ``200``. Any other request gets a response with HTTP status ``503``.
 
             If applying a configuration value fails, then write a response with HTTP status ``409``.
         """
         request = self._read_json_content()
         if request:
-            cluster = self.server.patroni.dcs.get_cluster()
+            dcs = self.server.patroni.dcs
+            cluster = dcs.get_cluster()
             if not (cluster.config and cluster.config.modify_version):
-                return self.send_error(503)
+                if set(request) != {'pause'}:
+                    return self.send_error(503)
+                pause = config_is_paused(request)
+                maintenance = cluster.maintenance
+                if not dcs.set_maintenance_value(maintenance_value(maintenance, pause),
+                                                 maintenance and maintenance.version):
+                    return self.send_error(409)
+                self.server.patroni.ha.wakeup()
+                return self._write_json_response(200, {'pause': pause})
             data = cluster.config.data.copy()
             if patch_config(data, request):
-                value = json.dumps(data, separators=(',', ':'))
-                if not self.server.patroni.dcs.set_config_value(value, cluster.config.version):
+                if not self._write_config(cluster, cluster.config.version, cluster.config.data, data):
                     return self.send_error(409)
             self.server.patroni.ha.wakeup()
             self._write_json_response(200, data)
@@ -848,15 +883,35 @@ class RestApiHandler(BaseHTTPRequestHandler):
         configuration, with HTTP status ``200``.
 
         .. note::
-            If applying the new configuration fails, then write a response with HTTP status ``502``.
+            The request replaces the configuration unconditionally, but each attempt is a conditional write against
+            the cluster state it was based on: whether ``pause`` changes, and so whether the ``/maintenance`` key is
+            written too, depends on that state. An attempt that failed, normally because it lost to a concurrent
+            change, is repeated against a fresh state. If none succeeds before ``retry_timeout`` passes, then write a
+            response with HTTP status ``502``.
         """
         request = self._read_json_content()
         if request:
-            cluster = self.server.patroni.dcs.get_cluster()
-            if not (cluster.config and deep_compare(request, cluster.config.data)):
-                value = json.dumps(request, separators=(',', ':'))
-                if not self.server.patroni.dcs.set_config_value(value):
-                    return self.send_error(502)
+            def put_config() -> None:
+                cluster = self.server.patroni.dcs.get_cluster()
+                if cluster.config and deep_compare(request, cluster.config.data):
+                    return
+                valid_config = cluster.config if cluster.config and cluster.config.modify_version else None
+                if valid_config:
+                    written = self._write_config(cluster, version=valid_config.version,
+                                                 config_before=valid_config.data, config_after=request)
+                else:
+                    # /config is missing, so the write is guarded by the /maintenance key: conditional on its version,
+                    # or create-only if it does not exist.
+                    written = self._write_config(cluster, version=None, config_before=None, config_after=request)
+                if not written:
+                    raise _ConfigWriteConflict
+
+            retry = Retry(deadline=global_config.get_int('retry_timeout', 10), max_delay=1, max_tries=-1,
+                          retry_exceptions=_ConfigWriteConflict)
+            try:
+                retry(put_config)
+            except RetryFailedError:
+                return self.send_error(502)
             self._write_json_response(200, request)
 
     @check_access

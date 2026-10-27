@@ -21,7 +21,7 @@ from ..dynamic_loader import iter_classes, iter_modules
 from ..exceptions import PatroniAssertionError, PatroniFatalException
 from ..site import ClusterSite
 from ..tags import Tags
-from ..utils import deep_compare, parse_int, uri
+from ..utils import deep_compare, parse_bool, parse_int, uri
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -642,6 +642,48 @@ class ClusterMaintenance(NamedTuple):
         """The recorded pause decision, or ``None`` if the key holds no decision."""
         pause = self.data.get('pause')
         return pause if isinstance(pause, bool) else None
+
+
+def config_is_paused(data: Optional[Dict[str, Any]]) -> bool:
+    """Check whether the dynamic configuration *data* pauses the cluster.
+
+    .. note::
+        ``pause`` is parsed as :attr:`~patroni.global_config.GlobalConfig.is_paused` parses it.
+
+    :param data: the dynamic configuration, or ``None``.
+
+    :returns: ``True`` if *data* sets ``pause``.
+
+    :Example:
+
+        >>> config_is_paused({'pause': 'on'}), config_is_paused({}), config_is_paused(None)
+        (True, False, False)
+    """
+    return bool(parse_bool((data or {}).get('pause')))
+
+
+def maintenance_value(maintenance: Optional[ClusterMaintenance], pause: bool) -> str:
+    """Serialize the ``/maintenance`` key with *pause* recorded.
+
+    .. note::
+        Fields of the key other than ``pause`` are kept, so that a field written by another release survives.
+
+    :param maintenance: the current content of the key, or ``None`` if it does not exist.
+    :param pause: the pause decision to record.
+
+    :returns: the new value of the key, serialized to JSON.
+
+    :Example:
+
+        >>> maintenance_value(None, True)
+        '{"pause":true}'
+
+        >>> maintenance_value(ClusterMaintenance(1, {'pause': True, 'reason': 'upgrade'}), False)
+        '{"pause":false,"reason":"upgrade"}'
+    """
+    data = dict(maintenance.data) if maintenance else {}
+    data['pause'] = pause
+    return json.dumps(data, separators=(',', ':'), sort_keys=True)
 
 
 class SyncState(NamedTuple):
@@ -1538,6 +1580,29 @@ class ConfigWrite(NamedTuple):
 
     config: bool
     maintenance: bool
+
+
+def write_config(dcs: 'AbstractDCS', version: Optional[Any], maintenance: Optional[ClusterMaintenance],
+                 config_before: Optional[Dict[str, Any]], config_after: Optional[Dict[str, Any]]) -> ConfigWrite:
+    """Write *config_after* to ``/config``, together with the ``/maintenance`` key if ``pause`` changes.
+
+    :param dcs: the DCS to write to.
+    :param version: as *version* of :meth:`AbstractDCS.set_config_value`.
+    :param maintenance: the ``/maintenance`` key the write is based on, or ``None`` if it does not exist.
+    :param config_before: the configuration the write replaces, or ``None`` to write the ``/maintenance`` key whether
+        or not ``pause`` changes.
+    :param config_after: the new configuration.
+
+    :returns: which keys were written. If ``pause`` does not change, only ``/config`` is written and *maintenance*
+        repeats its result, since the ``/maintenance`` key needs no write.
+    """
+    value = json.dumps(config_after, separators=(',', ':'))
+    pause = config_is_paused(config_after)
+    if config_before is not None and config_is_paused(config_before) == pause:
+        written = dcs.set_config_value(value, version)
+        return ConfigWrite(written, written)
+    return dcs.set_config_and_maintenance_value(value, version, maintenance_value(maintenance, pause),
+                                                maintenance and maintenance.version)
 
 
 class ReturnFalseException(Exception):
