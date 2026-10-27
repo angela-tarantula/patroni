@@ -1892,12 +1892,13 @@ def toggle_pause(cluster_name: str, group: Optional[int], paused: bool, wait: bo
 
     :raises:
         PatroniCtlException: if
-            * ``pause`` state is already *paused*; or
+            * the DCS holds a pause decision and it is already *paused*; or
             * cluster contains no accessible members.
     """
     dcs = get_dcs(cluster_name, group)
     cluster = dcs.get_cluster()
-    if global_config.from_cluster(cluster).is_paused == paused:
+    # Without a decision in the DCS, the request is sent: this process has no last known pause state to fall back to.
+    if global_config.dcs_pause_decision(cluster) == paused:
         raise PatroniCtlException('Cluster is {0} paused'.format(paused and 'already' or 'not'))
 
     for member in get_all_members_leader_first(cluster):

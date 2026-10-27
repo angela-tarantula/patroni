@@ -121,6 +121,18 @@ class GlobalConfig(types.ModuleType):
         ret.__config = self._with_pause(self.__config, pause)
         return ret
 
+    def dcs_pause_decision(self, cluster: Optional['Cluster']) -> Optional[bool]:
+        """Get the pause decision the DCS holds, without falling back to the current value.
+
+        :param cluster: the currently known cluster state from DCS.
+
+        :returns: ``pause`` from ``/config`` while it is valid, otherwise the decision recorded in the ``/maintenance``
+            key, or ``None`` if neither holds one.
+        """
+        if self._cluster_has_valid_config(cluster):
+            return self.from_cluster(cluster).is_paused
+        return self._maintenance_pause(cluster)
+
     def get(self, name: str) -> Any:
         """Gets global configuration value by *name*.
 
