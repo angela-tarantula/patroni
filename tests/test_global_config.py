@@ -40,12 +40,14 @@ class TestGlobalConfig(unittest.TestCase):
             for config_name, config in CONFIGS.items():
                 for mirror_name, mirror in MIRRORS.items():
                     with self.subTest(cached=cached, config=config_name, mirror=mirror_name):
+                        # expected: what pause resolves to; decision: what dcs_pause_decision() returns, which has no
+                        # cached tier, so it is None where the cached value decides
                         if config and config.modify_version:
-                            expected = config.data.get('pause', False)
+                            expected = decision = config.data.get('pause', False)
                         elif mirror and mirror.pause is not None:
-                            expected = mirror.pause
+                            expected = decision = mirror.pause
                         else:
-                            expected = cached
+                            expected, decision = cached, None
                         cluster = get_cluster(config, mirror)
 
                         updated = self.new(cached)
@@ -55,6 +57,7 @@ class TestGlobalConfig(unittest.TestCase):
                         base = self.new(cached)
                         self.assertEqual(base.from_cluster(cluster).is_paused, expected)
                         self.assertEqual(base.is_paused, cached)  # from_cluster() leaves its caller alone
+                        self.assertEqual(base.dcs_pause_decision(cluster), decision)
 
     def test_other_settings_keep_their_cached_values(self):
         default = {'pause': True, 'ttl': 25}
