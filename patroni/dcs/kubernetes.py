@@ -27,7 +27,8 @@ from ..postgresql.misc import PostgresqlRole, PostgresqlState
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, iter_response_objects, \
     keepalive_socket_options, Retry, RetryFailedError, tzutc, uri, USER_AGENT
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    ConfigWrite, Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -667,6 +668,15 @@ class ObjectCache(Thread):
             return logger.warning('Unexpected event type: %s', ev_type)
 
         if success and obj.get('kind') != 'Pod':
+            # The config object also carries the mirror, which wakes the loop on any change, including creation.
+            if name == self._dcs.config_path:
+                maintenance = getattr(self._dcs, '_MAINTENANCE')  # pyright: ignore
+                old_maintenance = old_value and (old_value.metadata.annotations or EMPTY_DICT).get(maintenance)
+                new_maintenance = None if ev_type == 'DELETED' \
+                    else (obj.metadata.annotations or EMPTY_DICT).get(maintenance)
+                if old_maintenance != new_maintenance:
+                    logger.debug('%s %s changed from %s to %s', name, maintenance, old_maintenance, new_maintenance)
+                    self._dcs.event.set()
             if old_value:
                 old_value = (old_value.metadata.annotations or EMPTY_DICT).get(self._annotations_map.get(name, ''))
 
@@ -881,6 +891,10 @@ class Kubernetes(AbstractDCS):
                                                       annotations.get(self._CONFIG) or '{}',
                                                       metadata.resource_version if self._CONFIG in annotations else 0)
 
+        # get the maintenance key, which shares the object and its resource version with the configuration
+        maintenance = ClusterMaintenance.from_node(metadata.resource_version, annotations[self._MAINTENANCE]) \
+            if metadata and self._MAINTENANCE in annotations else None
+
         # get timeline history
         history = metadata and TimelineHistory.from_node(metadata.resource_version,
                                                          annotations.get(self._HISTORY) or '[]')
@@ -942,7 +956,8 @@ class Kubernetes(AbstractDCS):
         metadata = sync and sync.metadata
         sync = SyncState.from_node(metadata and metadata.resource_version, metadata and metadata.annotations)
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: Dict[str, Any]) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.
@@ -1364,6 +1379,42 @@ class Kubernetes(AbstractDCS):
 
     def set_config_value(self, value: str, version: Optional[str] = None) -> bool:
         return self.patch_or_create_config({self._CONFIG: value}, version, bool(self._config_resource_version), False)
+
+    def _patch_config_with_maintenance(self, annotations: Dict[str, Any], resource_version: Optional[str],
+                                       create_only: bool) -> bool:
+        """Patch the config object conditionally, writing the ``maintenance`` annotation among *annotations*.
+
+        The ``maintenance`` annotation has no version of its own. When it is to be created only if absent, the write
+        fails if the cached object already carries it, and is otherwise conditional on *resource_version* or, without
+        one, on the cached object's resource version. If there is no object, it is created, which fails if another
+        writer created it first.
+
+        :param annotations: annotations to write, including ``maintenance``.
+        :param resource_version: the resource version the object must still have.
+        :param create_only: ``True`` if the ``maintenance`` annotation must not exist yet.
+
+        :returns: ``True`` if the object was written.
+        """
+        if create_only:
+            config = self._kinds.get(self.config_path)
+            if config:
+                if self._MAINTENANCE in (config.metadata.annotations or EMPTY_DICT):
+                    return False
+                resource_version = resource_version or config.metadata.resource_version
+        return self.patch_or_create_config(annotations, resource_version, bool(resource_version), False)
+
+    def set_maintenance_value(self, value: str, version: Optional[str] = None) -> bool:
+        return self._patch_config_with_maintenance({self._MAINTENANCE: value}, version, version is None)
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[str],
+                                         maintenance: str, maintenance_version: Optional[str]) -> ConfigWrite:
+        # Both annotations live on one object, so both keys report its single resource version, and one patch
+        # conditional on it writes both atomically. Two different versions mean one of them is stale.
+        if config_version is not None and maintenance_version is not None and config_version != maintenance_version:
+            return ConfigWrite(False, False)
+        ret = self._patch_config_with_maintenance({self._CONFIG: config, self._MAINTENANCE: maintenance},
+                                                  config_version or maintenance_version, maintenance_version is None)
+        return ConfigWrite(ret, ret)
 
     @catch_kubernetes_errors
     def touch_member(self, data: Dict[str, Any]) -> bool:

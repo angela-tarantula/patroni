@@ -6,6 +6,9 @@ class Consul:
     agent: 'Consul.Agent'
     session: 'Consul.Session'
     kv: 'Consul.KV'
+    txn: 'Consul.Txn'
+    class Txn:
+        def put(self, payload: List[Dict[str, Any]]) -> Dict[str, Any]: ...
     class KV:
         def get(self, key: str, index: Optional[int]=None, recurse: bool = False, wait: Optional[str] = None, token: Optional[str] = None, consistency: Optional[str] = None, keys: bool = False, separator: Optional[str] = '', dc: Optional[str] = None) -> Tuple[int, Dict[str, Any]]: ...
         def put(self, key: str, value: str, cas: Optional[int] = None, flags: Optional[int] = None, acquire: Optional[str] = None, release: Optional[str] = None, token: Optional[str] = None, dc: Optional[str] = None) -> bool: ...

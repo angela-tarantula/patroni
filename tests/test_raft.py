@@ -236,15 +236,23 @@ class TestRaft(unittest.TestCase):
         self.assertTrue(raft.initialize())
         self.assertTrue(raft.cancel_initialization())
         self.assertTrue(raft.set_config_value('{}'))
+        cluster = raft.get_cluster()
+        self.assertIsNotNone(cluster.config)
+        self.assertIsNone(cluster.maintenance)
         self.assertTrue(raft.write_sync_state('foo', 'bar', 0))
         self.assertFalse(raft.write_sync_state('foo', 'bar', 0, 1))
+        self.assertTrue(raft._sync_obj.set(raft.maintenance_path, '{"pause": true}'))
         raft._mpp = get_mpp({'citus': {'group': 1, 'database': 'postgres'}})
         self.assertTrue(raft.manual_failover('foo', 'bar', ''))
+        self.assertTrue(raft._sync_obj.set(raft.maintenance_path, '{"pause": false}'))
         raft._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
         self.assertTrue(raft.take_leader())
         cluster = raft.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertTrue(cluster.maintenance.pause)
+        self.assertFalse(cluster.workers[1].maintenance.pause)
+        self.assertIsNone(cluster.workers[1].config)
         self.assertTrue(raft.delete_leader(cluster.leader))
         self.assertTrue(raft._sync_obj.set(raft.status_path,
                                            '{"optime":1234567,"slots":{"ls":12345},"retain_slots":["postgresql0"]}'))
@@ -263,8 +271,46 @@ class TestRaft(unittest.TestCase):
         raft.watch(None, 0.001)
         raft._sync_obj.destroy()
 
+    def test_maintenance(self):
+        raft = get_dcs({'ttl': 30, 'scope': 'test', 'name': 'pg', 'retry_timeout': 10,
+                        'raft': {'self_addr': '127.0.0.1:1234', 'data_dir': self._TMP}})
+        # Destroyed here rather than in a cleanup, which runs after tearDown(): a failed assertion must not leave the
+        # node running, and it must be gone before tearDown() removes its files, which Windows can not delete open.
+        try:
+            raft.event.clear()
+            self.assertTrue(raft.set_maintenance_value('{"pause":true}'))
+            self.assertTrue(raft.event.is_set())  # creating the key wakes the HA loop
+            self.assertFalse(raft.set_maintenance_value('{"pause":false}'))  # create only
+            maintenance = raft.get_cluster().maintenance
+            raft.event.clear()
+            self.assertTrue(raft.set_maintenance_value('{"pause":false}', maintenance.version))
+            self.assertTrue(raft.event.is_set())
+            maintenance = raft.get_cluster().maintenance
+            self.assertFalse(raft.set_maintenance_value('{"pause":false}', maintenance.version + 1))
+            # an unparsable value holds no decision but keeps its version, so a conditional write replaces it
+            self.assertTrue(raft.set_maintenance_value('{}', maintenance.version))
+            maintenance = raft.get_cluster().maintenance
+            self.assertIsNone(maintenance.pause)
+            self.assertTrue(raft.set_maintenance_value('{"pause":false}', maintenance.version))
+
+            # /config first, then the mirror only if /config was written
+            maintenance = raft.get_cluster().maintenance
+            self.assertEqual(raft.set_config_and_maintenance_value('{}', None, '{"pause":true}', maintenance.version),
+                             (True, True))
+            cluster = raft.get_cluster()
+            self.assertEqual(raft.set_config_and_maintenance_value('{"a":1}', cluster.config.version, '{}',
+                                                                   cluster.maintenance.version + 1), (True, False))
+            self.assertEqual(raft.set_config_and_maintenance_value('{}', cluster.config.version, '{}', None),
+                             (False, False))
+            cluster = raft.get_cluster()
+            self.assertEqual(cluster.config.data, {'a': 1})
+            self.assertTrue(cluster.maintenance.pause)
+        finally:
+            raft._sync_obj.destroy()
+
     def tearDown(self):
-        remove_files(os.path.join(self._TMP, '127.0.0.1:1234.'))
+        # Raft names its files after self_addr, with ':' replaced by '_' on Windows
+        remove_files(os.path.join(self._TMP, '127.0.0.1_1234.' if os.name == 'nt' else '127.0.0.1:1234.'))
 
     def setUp(self):
         self.tearDown()

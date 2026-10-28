@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import sys
 
@@ -9,8 +10,8 @@ import etcd
 from patroni import global_config
 from patroni.collections import CaseInsensitiveSet
 from patroni.config import Config
-from patroni.dcs import Cluster, ClusterConfig, Failover, get_dcs, \
-    Leader, Member, RemoteMember, Status, SyncState, TimelineHistory
+from patroni.dcs import Cluster, ClusterConfig, ClusterMaintenance, Failover, \
+    get_dcs, Leader, Member, RemoteMember, Status, SyncState, TimelineHistory
 from patroni.dcs.etcd import AbstractEtcdClientWithFailover
 from patroni.exceptions import DCSError, PatroniFatalException, PostgresConnectionException
 from patroni.ha import _MemberStatus, Ha
@@ -1871,6 +1872,119 @@ class TestHa(PostgresInit):
         self.ha.cluster.config.data.clear()
         self.ha.has_lock = true
         self.assertEqual(self.ha.run_cycle(), 'no action. I am (postgresql0), the leader with the lock')
+
+    def _set_cached_configuration(self, configuration):
+        # what a node caches: its dynamic configuration (patroni.dynamic.json) and the global configuration
+        self.ha.patroni.config.set_dynamic_configuration(configuration)
+        global_config.update(None, configuration)
+
+    @staticmethod
+    def _with_config(cluster, config, maintenance):
+        # the same cluster with the given /config and /maintenance key
+        return Cluster(cluster.initialize, config, *cluster[2:10], maintenance)
+
+    # /config missing, and /config present but not valid, as an unparsable value or a Kubernetes config object that
+    # hold only the maintenance annotation loads
+    CONFIGS_TO_RESTORE = (None, ClusterConfig(1, {}, 0))
+
+    @patch('patroni.postgresql.mtime', Mock(return_value=1588316884))
+    @patch('builtins.open', Mock(side_effect=Exception))
+    def test_restore_cluster_config_after_resume(self):
+        self._set_cached_configuration({'ttl': 30, 'pause': True})
+        self.ha.cluster = self._with_config(get_cluster_initialized_with_leader(), None,
+                                            ClusterMaintenance(1, {'pause': False}))
+        self.ha.has_lock = true
+        self.ha.dcs.set_config_value = Mock(return_value=True)
+        self.ha.dcs.get_cluster = Mock(return_value=self.ha.cluster)
+        self.ha.run_cycle()
+        self.assertNotIn('pause', json.loads(self.ha.dcs.set_config_value.call_args[0][0]))
+
+    @patch('patroni.postgresql.mtime', Mock(return_value=1588316884))
+    @patch('builtins.open', Mock(side_effect=Exception))
+    def test_restore_cluster_config_uses_resolved_pause(self):
+        standby = {'standby_cluster': {'host': 'remote', 'port': 5432}}
+        for config, extra in ((c, e) for c in self.CONFIGS_TO_RESTORE for e in ({}, standby)):
+            for maintenance, expected in ((ClusterMaintenance(1, {'pause': True}), True),
+                                          (ClusterMaintenance(1, {'pause': False}), False),
+                                          (None, True)):
+                with self.subTest(config=config, standby=bool(extra), maintenance=maintenance):
+                    self._set_cached_configuration({'ttl': 30, 'pause': True, **extra})
+                    self.ha.cluster = self._with_config(get_cluster_initialized_with_leader(), config, maintenance)
+                    self.ha.has_lock = true
+                    self.ha.dcs.set_config_value = Mock(return_value=True)
+                    self.ha.dcs.get_cluster = Mock(return_value=self.ha.cluster)
+                    self.ha.run_cycle()
+                    written = json.loads(self.ha.dcs.set_config_value.call_args[0][0])
+                    self.assertEqual(written.pop('pause', False), expected)
+                    # everything else still comes from the cache
+                    cached = self.ha.patroni.config.dynamic_configuration
+                    cached.pop('pause')
+                    self.assertEqual(written, cached)
+
+    def test_post_bootstrap_uses_resolved_pause(self):
+        for config, (maintenance, expected) in ((c, m) for c in self.CONFIGS_TO_RESTORE
+                                                for m in ((ClusterMaintenance(1, {'pause': True}), True),
+                                                          (ClusterMaintenance(1, {'pause': False}), False),
+                                                          (None, True))):
+            with self.subTest(config=config, maintenance=maintenance):
+                self._set_cached_configuration({'ttl': 30, 'pause': True})
+                self.ha.cluster = self._with_config(get_cluster_initialized_without_leader(), config, maintenance)
+                global_config.update(self.ha.cluster)  # as the HA cycle that runs post_bootstrap() does
+                with self.ha._async_response:
+                    self.ha._async_response.complete(True)
+                self.ha.dcs.initialize = Mock()
+                self.ha.dcs.take_leader = Mock()
+                self.ha.dcs.set_config_value = Mock(return_value=True)
+                self.assertEqual(self.ha.post_bootstrap(), 'initialized a new cluster')
+                written = json.loads(self.ha.dcs.set_config_value.call_args[0][0])
+                self.assertEqual(written.get('pause', False), expected)
+
+    def test_update_pause_copy(self):
+        roles = {'the leader-lock holder': (True, 'leader'), 'another member holds the lock': (True, 'postgresql0'),
+                 'no leader': (False, 'postgresql0')}
+        configs = {'paused': ClusterConfig(1, {'pause': True}, 1), 'resumed': ClusterConfig(1, {}, 1),
+                   'not valid': ClusterConfig(1, {}, 0), 'missing': None}
+        mirrors = {'paused': ClusterMaintenance(2, {'pause': True, 'x': 1}),
+                   'resumed': ClusterMaintenance(2, {'pause': False, 'x': 1}),
+                   'no decision': ClusterMaintenance(2, {'x': 1}), 'absent': None}
+        for role, (locked, name) in roles.items():
+            for config_name, config in configs.items():
+                for mirror_name, mirror in mirrors.items():
+                    with self.subTest(role=role, config=config_name, mirror=mirror_name):
+                        self.p.name = name
+                        self.ha.cluster = self._with_config(get_cluster_initialized_without_leader(leader=locked),
+                                                            config, mirror)
+                        self.ha.dcs.set_maintenance_value = Mock(return_value=True)
+                        self.ha._update_pause_copy()
+                        # /config decides while it is valid, and only the lock holder, or anyone without a leader,
+                        # copies a different decision into the mirror, keeping its other fields
+                        decision = bool(config and config.modify_version and config.data.get('pause'))
+                        if role != 'another member holds the lock' and config and config.modify_version \
+                                and not (mirror and mirror.pause == decision):
+                            value = json.dumps({**(mirror.data if mirror else {}), 'pause': decision},
+                                               separators=(',', ':'), sort_keys=True)
+                            self.ha.dcs.set_maintenance_value.assert_called_once_with(value, mirror and mirror.version)
+                        else:
+                            self.ha.dcs.set_maintenance_value.assert_not_called()
+
+        # a failed write is left for the next loop, and only a successful one is logged
+        self.ha.cluster = self._with_config(get_cluster_initialized_without_leader(), configs['paused'], None)
+        for written in (False, True):
+            self.ha.dcs.set_maintenance_value = Mock(return_value=written)
+            with patch('patroni.ha.logger.info') as mock_info:
+                self.ha._update_pause_copy()
+            self.assertEqual(mock_info.call_count, int(written))
+
+    @patch.object(Cluster, 'is_unlocked', Mock(return_value=False))
+    def test_run_cycle_updates_pause_copy_while_paused(self):
+        # a cluster upgraded while paused gets its mirror from /config
+        self.ha.has_lock = true
+        self.ha.cluster = self._with_config(get_cluster_initialized_with_leader(), ClusterConfig(1, {'pause': True}, 1),
+                                            None)
+        global_config.update(self.ha.cluster)
+        self.ha.dcs.set_maintenance_value = Mock(return_value=True)
+        self.assertEqual(self.ha.run_cycle(), 'PAUSE: no action. I am (postgresql0), the leader with the lock')
+        self.ha.dcs.set_maintenance_value.assert_called_once_with('{"pause":true}', None)
 
     @patch.object(global_config.__class__, 'primary_race_backoff', PropertyMock(return_value=3))
     def test_primary_race_backoff(self):

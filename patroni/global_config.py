@@ -45,11 +45,42 @@ class GlobalConfig(types.ModuleType):
         """
         return bool(cluster and cluster.config and cluster.config.modify_version)
 
+    @staticmethod
+    def _maintenance_pause(cluster: Optional['Cluster']) -> Optional[bool]:
+        """Get the pause decision recorded in the ``/maintenance`` key of *cluster*.
+
+        .. note::
+            The key is a mirror of ``pause`` that can be written while ``/config`` can not, so while ``/config`` is
+            missing it decides ``pause``.
+
+        :param cluster: the currently known cluster state from DCS.
+
+        :returns: the recorded decision, or ``None`` if the key is absent or holds no decision.
+        """
+        return cluster.maintenance.pause if cluster and cluster.maintenance else None
+
+    @staticmethod
+    def _with_pause(config: Dict[str, Any], pause: bool) -> Dict[str, Any]:
+        """Get a copy of *config* with ``pause`` set to *pause*.
+
+        :param config: the configuration to copy. It is not modified.
+        :param pause: the pause decision to apply.
+
+        :returns: a copy of *config* in which only ``pause`` differs.
+        """
+        ret = {name: value for name, value in config.items() if name != 'pause'}
+        if pause:
+            ret['pause'] = True
+        return ret
+
     def update(self, cluster: Optional['Cluster'], default: Optional[Dict[str, Any]] = None) -> None:
         """Update with the new global configuration from the :class:`Cluster` object view.
 
         .. note::
             Update happens in-place and is executed only from the main heartbeat thread.
+
+            ``pause`` resolves as ``/config`` while it is valid, then the ``/maintenance`` key, then the current value.
+            Every other setting comes from ``/config`` while it is valid, and otherwise keeps its current value.
 
         :param cluster: the currently known cluster state from DCS.
         :param default: default configuration, which will be used if there is no valid *cluster.config*.
@@ -57,15 +88,18 @@ class GlobalConfig(types.ModuleType):
         # Try to protect from the case when DCS was wiped out
         if self._cluster_has_valid_config(cluster):
             self.__config = cluster.config.data  # pyright: ignore [reportOptionalMemberAccess]
-        elif default:
-            self.__config = default
+        else:
+            config = default or self.__config
+            pause = self._maintenance_pause(cluster)
+            self.__config = config if pause is None else self._with_pause(config, pause)
 
     def from_cluster(self, cluster: Optional['Cluster']) -> 'GlobalConfig':
         """Return :class:`GlobalConfig` instance from the provided :class:`Cluster` object view.
 
         .. note::
             If the provided *cluster* object doesn't have a valid global configuration we return
-            the last known valid state of the :class:`GlobalConfig` object.
+            the last known valid state of the :class:`GlobalConfig` object, with ``pause`` taken from the
+            ``/maintenance`` key if it holds a decision.
 
             This method is used when we need to have the most up-to-date values in the global configuration,
             but we don't want to update the global object.
@@ -74,12 +108,30 @@ class GlobalConfig(types.ModuleType):
 
         :returns: :class:`GlobalConfig` object.
         """
-        if not self._cluster_has_valid_config(cluster):
+        if self._cluster_has_valid_config(cluster):
+            ret = GlobalConfig()
+            ret.update(cluster)
+            return ret
+
+        pause = self._maintenance_pause(cluster)
+        if pause is None:
             return self
 
         ret = GlobalConfig()
-        ret.update(cluster)
+        ret.__config = self._with_pause(self.__config, pause)
         return ret
+
+    def dcs_pause_decision(self, cluster: Optional['Cluster']) -> Optional[bool]:
+        """Get the pause decision the DCS holds, without falling back to the current value.
+
+        :param cluster: the currently known cluster state from DCS.
+
+        :returns: ``pause`` from ``/config`` while it is valid, otherwise the decision recorded in the ``/maintenance``
+            key, or ``None`` if neither holds one.
+        """
+        if self._cluster_has_valid_config(cluster):
+            return self.from_cluster(cluster).is_paused
+        return self._maintenance_pause(cluster)
 
     def get(self, name: str) -> Any:
         """Gets global configuration value by *name*.

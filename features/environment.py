@@ -442,6 +442,10 @@ class AbstractDcsController(AbstractController):
     def cleanup_service_tree(self):
         """ clean all contents stored in the tree used for the tests """
 
+    def wipe(self):
+        """ remove all keys stored in the tree used for the tests while Patroni keeps running """
+        self.cleanup_service_tree()
+
     @classmethod
     def get_subclasses(cls):
         for subclass in cls.__subclasses__():
@@ -705,6 +709,14 @@ class KubernetesController(AbstractExternalDcsController):
             if len(result.items) < 1:
                 break
 
+    def wipe(self):
+        self._api.delete_collection_namespaced_endpoints(self._namespace, label_selector=self._label_selector)
+        # member data is the 'status' annotation on each pod
+        result = self._api.list_namespaced_pod(self._namespace, label_selector=self._label_selector)
+        for pod in result.items:
+            self._api.patch_namespaced_pod(pod.metadata.name, self._namespace,
+                                           {'metadata': {'annotations': {'status': None}}})
+
 
 class ZooKeeperController(AbstractExternalDcsController):
 
@@ -736,6 +748,30 @@ class ZooKeeperController(AbstractExternalDcsController):
             return
         except Exception as e:
             assert False, "exception when cleaning up zookeeper contents: {0}".format(e)
+
+    def wipe(self):
+        import kazoo.exceptions
+
+        # Delete the whole tree in one transaction, as the other DCSs delete it in one request. Deleting nodes one at
+        # a time fires the watches that running members keep on them, and they re-create their nodes before the walk
+        # reaches the parent. A member can still write between the listing and the commit, so repeat until it lands.
+        path = self.path(scope='').rstrip('/')
+        attempts = 10
+        for _ in range(attempts):
+            nodes = [path]
+            for node in nodes:  # breadth first, so that reversed() deletes children before their parents
+                try:
+                    nodes.extend(node + '/' + child for child in self._client.get_children(node))
+                except kazoo.exceptions.NoNodeError:
+                    pass
+            transaction = self._client.transaction()
+            for node in reversed(nodes):
+                transaction.delete(node)
+            if not any(isinstance(result, Exception) for result in transaction.commit()) \
+                    or not self._client.exists(path):
+                break
+        else:
+            assert False, "could not wipe {0} after {1} attempts".format(path, attempts)
 
     def _is_running(self):
         if not super(ZooKeeperController, self)._is_running():
@@ -800,6 +836,9 @@ class RaftController(AbstractDcsController):
 
     def set(self, key, value):
         self._raft.set(self.path(key), value)
+
+    def wipe(self):
+        self._raft.delete(self.path(scope=''), recursive=True)
 
     def cleanup_service_tree(self):
         from patroni.dcs.raft import KVStoreTTL

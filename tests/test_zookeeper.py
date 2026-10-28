@@ -1,15 +1,16 @@
 import select
 import unittest
 
+from unittest import mock
 from unittest.mock import Mock, patch, PropertyMock
 
 from kazoo.client import KazooClient
-from kazoo.exceptions import NodeExistsError, NoNodeError
+from kazoo.exceptions import BadVersionError, NodeExistsError, NoNodeError, RolledBackError
 from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.protocol.states import KeeperState, WatchedEvent, ZnodeStat
 from kazoo.retry import RetryFailedError
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.zookeeper import Cluster, PatroniKazooClient, \
     PatroniSequentialThreadingHandler, ZooKeeper, ZooKeeperError
 from patroni.postgresql.mpp import get_mpp
@@ -19,7 +20,7 @@ class MockKazooClient(Mock):
 
     handler = PatroniSequentialThreadingHandler(10)
     leader = False
-    exists = True
+    member_exists = True
 
     def __init__(self, *args, **kwargs):
         super(MockKazooClient, self).__init__()
@@ -43,7 +44,7 @@ class MockKazooClient(Mock):
         elif '/members/' in path:
             return (
                 b'postgres://repuser:rep-pass@localhost:5434/postgres?application_name=http://127.0.0.1:8009/patroni',
-                ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0 if self.exists else -1, 0, 0, 0)
+                ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0 if self.member_exists else -1, 0, 0, 0)
             )
         elif path.endswith('/optime/leader'):
             return (b'500', ZnodeStat(0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0))
@@ -58,6 +59,12 @@ class MockKazooClient(Mock):
                     ZnodeStat(0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0))
         elif path.endswith('/failsafe'):
             return (b'{a}', ZnodeStat(0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0))
+        elif path.endswith('/config'):
+            return (b'{"pause": true}', ZnodeStat(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        elif path == '/service/test/1/maintenance':
+            return (b'{"pause": false}', ZnodeStat(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        elif path.endswith('/maintenance'):
+            return (b'{"pause": true}', ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         return (b'', ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
     @staticmethod
@@ -66,8 +73,13 @@ class MockKazooClient(Mock):
             raise TypeError("Invalid type for 'path' (string expected)")
         if path.startswith('/no_node'):
             raise NoNodeError
-        elif path in ['/service/bla/', '/service/test/']:
-            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', '0', '1']
+        elif path == '/service/bla/':
+            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', 'config', '0', '1']
+        elif path == '/service/test/':
+            return ['initialize', 'leader', 'members', 'optime', 'failover', 'sync', 'failsafe', 'maintenance',
+                    '0', '1']
+        elif path == '/service/test/1/':
+            return ['maintenance']
         return ['foo', 'bar', 'buzz']
 
     def create(self, path, value=b"", acl=None, ephemeral=False, sequence=False, makepath=False):
@@ -79,7 +91,7 @@ class MockKazooClient(Mock):
             raise Exception
         if path.endswith('/initialize') or path == '/service/test/optime/leader':
             raise Exception
-        elif b'retry' in value or (b'exists' in value and self.exists):
+        elif b'retry' in value or (b'exists' in value and self.member_exists):
             raise NodeExistsError
 
     def create_async(self, path, value=b"", acl=None, ephemeral=False, sequence=False, makepath=False):
@@ -102,13 +114,17 @@ class MockKazooClient(Mock):
                 return
         raise NoNodeError
 
+    @staticmethod
+    def exists(path, watch=None):
+        return None
+
     def set_async(self, path, value, version=-1):
         return self.set(path, value, version) or Mock()
 
     def delete(self, path, version=-1, recursive=False):
         if not isinstance(path, str):
             raise TypeError("Invalid type for 'path' (string expected)")
-        self.exists = False
+        self.member_exists = False
         if path == '/service/test/leader':
             self.leader = True
             raise Exception
@@ -171,7 +187,10 @@ class TestZooKeeper(unittest.TestCase):
 
     def test__cluster_loader(self):
         self.zk._base_path = self.zk._base_path.replace('test', 'bla')
-        self.zk._postgresql_cluster_loader(self.zk.client_path(''))
+        cluster = self.zk._postgresql_cluster_loader(self.zk.client_path(''))
+        # the version is the znode's data version and the modify version its mzxid
+        self.assertEqual(cluster.config, ClusterConfig(0, {'pause': True}, 1))
+        self.assertIsNone(cluster.maintenance)
         self.zk._base_path = self.zk._base_path = '/broken'
         self.zk._postgresql_cluster_loader(self.zk.client_path(''))
         self.zk._base_path = self.zk._base_path = '/legacy'
@@ -182,6 +201,9 @@ class TestZooKeeper(unittest.TestCase):
     def test_get_cluster(self):
         cluster = self.zk.get_cluster()
         self.assertEqual(cluster.status.last_lsn, 500)
+        self.assertEqual(cluster.maintenance, ClusterMaintenance(0, {'pause': True}))
+        self.zk._base_path = '/service/foo'
+        self.assertIsNone(self.zk.get_cluster().maintenance)
 
     def test__get_citus_cluster(self):
         self.zk._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
@@ -189,6 +211,8 @@ class TestZooKeeper(unittest.TestCase):
             cluster = self.zk.get_cluster()
             self.assertIsInstance(cluster, Cluster)
             self.assertIsInstance(cluster.workers[1], Cluster)
+            self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(1, {'pause': False}))
+            self.assertIsNone(cluster.workers[1].config)
 
     @patch('patroni.dcs.logger.error')
     def test_get_mpp_coordinator(self, mock_logger):
@@ -225,6 +249,47 @@ class TestZooKeeper(unittest.TestCase):
         self.zk.set_config_value('', 1)
         self.zk.set_config_value('ok')
         self.zk.set_config_value('Exception')
+
+    def test_set_maintenance_value(self):
+        with patch.object(MockKazooClient, 'create', Mock()) as mock_create:
+            self.assertTrue(self.zk.set_maintenance_value('{}'))
+            mock_create.assert_called_once_with('/service/test/maintenance', b'{}', makepath=True)
+        with patch.object(MockKazooClient, 'create', Mock(side_effect=NodeExistsError)):
+            self.assertFalse(self.zk.set_maintenance_value('{}'))
+        with patch.object(MockKazooClient, 'set', Mock()) as mock_set:
+            # a newly created node has version 0, which must stay conditional
+            self.assertTrue(self.zk.set_maintenance_value('{}', 0))
+            mock_set.assert_called_once_with('/service/test/maintenance', b'{}', version=0)
+        with patch.object(MockKazooClient, 'set', Mock(side_effect=BadVersionError)):
+            self.assertFalse(self.zk.set_maintenance_value('{}', 0))
+        with patch.object(MockKazooClient, 'set', Mock(side_effect=Exception)):
+            self.assertFalse(self.zk.set_maintenance_value('{}', 0))
+
+    def test_set_config_and_maintenance_value(self):
+        transaction = Mock()
+        transaction.commit.return_value = [Mock(), Mock()]
+        with patch.object(MockKazooClient, 'transaction', Mock(return_value=transaction), create=True):
+            self.assertEqual(self.zk.set_config_and_maintenance_value('{}', 0, '{"pause":true}', None), (True, True))
+            transaction.set_data.assert_called_once_with('/service/test/config', b'{}', 0)
+            transaction.create.assert_called_once_with('/service/test/maintenance', b'{"pause":true}')
+
+            # one failed operation rolls back the whole transaction
+            transaction.reset_mock()
+            transaction.commit.return_value = [BadVersionError(), RolledBackError()]
+            with patch.object(MockKazooClient, 'exists', Mock(return_value=True)):
+                self.assertEqual(self.zk.set_config_and_maintenance_value('{}', None, '{}', 3), (False, False))
+            self.assertEqual(transaction.set_data.call_args_list, [mock.call('/service/test/config', b'{}', -1),
+                                                                   mock.call('/service/test/maintenance', b'{}', 3)])
+
+            # a missing /config is created, with its parent, because a transaction can not create missing parents
+            transaction.reset_mock()
+            transaction.commit.return_value = [Mock(), Mock()]
+            self.assertEqual(self.zk.set_config_and_maintenance_value('{}', None, '{}', None), (True, True))
+            self.zk._client.ensure_path.assert_called_with('/service/test')
+            self.assertEqual(transaction.create.call_args_list, [mock.call('/service/test/config', b'{}'),
+                                                                 mock.call('/service/test/maintenance', b'{}')])
+        with patch.object(MockKazooClient, 'transaction', Mock(side_effect=Exception), create=True):
+            self.assertEqual(self.zk.set_config_and_maintenance_value('{}', 0, '{}', 0), (False, False))
 
     def test_initialize(self):
         self.assertFalse(self.zk.initialize())
@@ -307,6 +372,31 @@ class TestZooKeeper(unittest.TestCase):
 
     def test_set_history_value(self):
         self.zk.set_history_value('{}')
+
+    def test_maintenance_watch(self):
+        with patch.object(self.zk, 'get_node', Mock(side_effect=self.zk.get_node)) as mock_get_node:
+            self.zk.get_cluster()
+            mock_get_node.assert_any_call('/service/test/maintenance', watch=self.zk._watcher)
+
+        # absent: watched with exists(), which wakes the loop if the node was created in the meantime
+        self.zk._base_path = '/service/bla'
+        with patch.object(MockKazooClient, 'exists', Mock(return_value=None)) as mock_exists:
+            self.zk.event.clear()
+            self.zk.get_cluster()
+            mock_exists.assert_called_once_with('/service/bla/maintenance', watch=self.zk._watcher)
+            self.assertFalse(self.zk.event.is_set())
+            mock_exists.return_value = ZnodeStat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            self.zk.get_cluster()
+            self.assertTrue(self.zk.event.is_set())
+
+        # other groups are loaded without a watch
+        self.zk._base_path = '/service/test'
+        self.zk._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
+        with patch.object(self.zk, 'get_node', Mock(side_effect=self.zk.get_node)) as mock_get_node, \
+                patch.object(MockKazooClient, 'exists', Mock(return_value=None)) as mock_exists:
+            self.zk.get_cluster()
+            mock_get_node.assert_any_call('/service/test/1/maintenance', watch=None)
+            mock_exists.assert_called_once_with('/service/test/0/maintenance', watch=self.zk._watcher)
 
     def test_watcher(self):
         self.zk._watcher(WatchedEvent('', '', ''))

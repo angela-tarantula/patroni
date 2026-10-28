@@ -94,3 +94,8 @@ def standby_cluster_archive(context, scope, demote=False):
 @step('I demote cluster {scope:name}')
 def demote_cluster(context, scope):
     standby_cluster_archive(context, scope, True)
+
+
+@step('I wipe the DCS')
+def wipe_dcs(context):
+    context.dcs_ctl.wipe()

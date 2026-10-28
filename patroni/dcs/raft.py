@@ -16,7 +16,8 @@ from pysyncobj.utility import TcpUtility
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..utils import validate_directory
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 # Mapping from Patroni snake_case config keys to pysyncobj camelCase SyncObjConf kwargs.
 # Ordered to reflect the logical dependency chain used in constraint validation.
@@ -354,7 +355,7 @@ class Raft(AbstractDCS):
         if key == value['created'] == value['updated'] and \
                 (key.startswith(self.members_path) or key == self.leader_path and leader != self._name) or \
                 key in (self.leader_optime_path, self.status_path) and leader != self._name or \
-                key in (self.config_path, self.sync_path):
+                key in (self.config_path, self.maintenance_path, self.sync_path):
             self.event.set()
 
     def _on_delete(self, key: str) -> None:
@@ -387,6 +388,10 @@ class Raft(AbstractDCS):
         # get global dynamic configuration
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config['index'], config['value'])
+
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance['index'], maintenance['value'])
 
         # get timeline history
         history = nodes.get(self._HISTORY)
@@ -422,7 +427,8 @@ class Raft(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _postgresql_cluster_loader(self, path: str) -> Cluster:
         """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.
@@ -482,6 +488,11 @@ class Raft(AbstractDCS):
 
     def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
         return self._sync_obj.set(self.config_path, value, prevIndex=version) is not False
+
+    def set_maintenance_value(self, value: str, version: Optional[int] = None) -> bool:
+        if version is None:
+            return self._sync_obj.set(self.maintenance_path, value, prevExist=False) is not False
+        return self._sync_obj.set(self.maintenance_path, value, prevIndex=version) is not False
 
     def touch_member(self, data: Dict[str, Any]) -> bool:
         value = json.dumps(data, separators=(',', ':'))
