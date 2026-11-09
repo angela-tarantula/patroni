@@ -9,7 +9,7 @@ import urllib3.util.connection
 from dns.exception import DNSException
 from urllib3.exceptions import ReadTimeoutError
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, ConfigWrite, get_dcs, write_config
 from patroni.dcs.etcd import AbstractDCS, Cluster, DnsCachingResolver, Etcd, EtcdClient, EtcdError
 from patroni.exceptions import DCSError
 from patroni.postgresql.mpp import get_mpp
@@ -48,10 +48,14 @@ def etcd_read(self, key, **kwargs):
     response = {"action": "get", "node": {"key": "/service/batman5", "dir": True, "nodes": [
                 {"key": "/service/batman5/1", "dir": True, "nodes": [
                     {"key": "/service/batman5/1/initialize", "value": "2164261704",
-                     "modifiedIndex": 20729, "createdIndex": 20729}],
+                     "modifiedIndex": 20729, "createdIndex": 20729},
+                    {"key": "/service/batman5/1/maintenance", "value": '{"pause": false}',
+                     "modifiedIndex": 20730, "createdIndex": 20730}],
                  "modifiedIndex": 20437, "createdIndex": 20437},
                 {"key": "/service/batman5/config", "value": '{"synchronous_mode": 0, "failsafe_mode": true}',
                  "modifiedIndex": 1582, "createdIndex": 1582},
+                {"key": "/service/batman5/maintenance", "value": '{"pause": true}',
+                 "modifiedIndex": 1583, "createdIndex": 1583},
                 {"key": "/service/batman5/failover", "value": "",
                  "modifiedIndex": 1582, "createdIndex": 1582},
                 {"key": "/service/batman5/initialize", "value": "postgresql0",
@@ -85,6 +89,11 @@ def etcd_read(self, key, **kwargs):
         response['node']['nodes'].pop()
     if key == '/service/broken/':
         response['node']['nodes'][-1]['value'] = '{'
+    if key == '/service/nomaintenance/':
+        response['node']['nodes'] = [n for n in response['node']['nodes']
+                                     if n['key'] != '/service/batman5/maintenance']
+        next(n for n in response['node']['nodes'] if n['key'] == '/service/batman5/config')['value'] = \
+            '{"pause": true}'
     result = etcd.EtcdResult(**response)
     result.etcd_index = 0
     return result
@@ -292,14 +301,20 @@ class TestEtcd(unittest.TestCase):
     def test_get_cluster(self):
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
+        self.assertEqual(cluster.maintenance, ClusterMaintenance(1583, {'pause': True}))
         self.etcd._base_path = '/service/legacy'
         self.assertIsInstance(self.etcd.get_cluster(), Cluster)
         self.etcd._base_path = '/service/broken'
         self.assertIsInstance(self.etcd.get_cluster(), Cluster)
+        self.etcd._base_path = '/service/nomaintenance'
+        cluster = self.etcd.get_cluster()
+        self.assertEqual(cluster.config, ClusterConfig(1582, {'pause': True}, 1582))
+        self.assertIsNone(cluster.maintenance)
         self.etcd._base_path = '/service/nocluster'
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsNone(cluster.leader)
+        self.assertIsNone(cluster.maintenance)
         self.etcd._base_path = '/service/noleader'
         self.assertRaises(EtcdError, self.etcd.get_cluster)
 
@@ -308,6 +323,8 @@ class TestEtcd(unittest.TestCase):
         cluster = self.etcd.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(20730, {'pause': False}))
+        self.assertIsNone(cluster.workers[1].config)
         self.etcd._base_path = '/service/nocluster'
         self.assertTrue(self.etcd.get_cluster().is_empty())
 
@@ -373,6 +390,51 @@ class TestEtcd(unittest.TestCase):
     def test_set_ttl(self):
         self.etcd.set_ttl(20)
         self.assertTrue(self.etcd.watch(None, 1))
+
+    def test_set_maintenance_value(self):
+        with patch.object(etcd.Client, 'write', Mock(return_value=True)) as mock_write:
+            self.assertTrue(self.etcd.set_maintenance_value('{}'))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevExist=False)
+            self.assertTrue(self.etcd.set_maintenance_value('{}', 5))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevIndex=5)
+        with patch.object(etcd.Client, 'write', Mock(side_effect=etcd.EtcdAlreadyExist)):
+            self.assertFalse(self.etcd.set_maintenance_value('{}'))
+
+    def test_set_config_and_maintenance_value(self):
+        with patch.object(etcd.Client, 'write', Mock(side_effect=[True, True, True, etcd.EtcdCompareFailed,
+                                                                  etcd.EtcdCompareFailed])) as mock_write:
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', 2), (True, True))
+            mock_write.assert_called_with(self.etcd.maintenance_path, '{}', prevIndex=2)
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', 2), (True, False))
+            # the mirror is not written when /config was not
+            self.assertEqual(self.etcd.set_config_and_maintenance_value('{}', 1, '{}', None), (False, False))
+            self.assertEqual(mock_write.call_count, 5)
+            mock_write.assert_called_with(self.etcd.config_path, '{}', prevIndex=1)
+
+    def test_write_config(self):
+        # write_config() is backend-independent; Etcd only supplies a concrete DCS whose two write methods are patched
+        mirror = ClusterMaintenance(4, {'pause': True, 'x': 1})
+        both = 'set_config_and_maintenance_value'
+        # config before, config after, what the config-only and the combined writes return -> the writes made and the
+        # result
+        for before, after, config_written, both_written, writes, result in (
+                ({'pause': True}, {'pause': True, 'ttl': 20}, True, None,
+                 [('set_config_value', '{"pause":true,"ttl":20}', 3)], (True, True)),
+                ({'pause': True}, {'ttl': 20}, None, ConfigWrite(True, True),
+                 [(both, '{"ttl":20}', 3, '{"pause":false,"x":1}', 4)], (True, True)),
+                # where the keys are written one after the other, a failed mirror write is passed on to the caller
+                ({'pause': True}, {'ttl': 20}, None, ConfigWrite(True, False),
+                 [(both, '{"ttl":20}', 3, '{"pause":false,"x":1}', 4)], (True, False)),
+                (None, {'pause': True}, None, ConfigWrite(True, True),  # /config did not decide pause
+                 [(both, '{"pause":true}', 3, '{"pause":true,"x":1}', 4)], (True, True)),
+                ({}, {'ttl': 20}, False, None, [('set_config_value', '{"ttl":20}', 3)], (False, False))):
+            with self.subTest(before=before, after=after, config_written=config_written, both_written=both_written):
+                with patch.object(Etcd, 'set_config_value', Mock(return_value=config_written)) as mock_set, \
+                        patch.object(Etcd, both, Mock(return_value=both_written)) as mock_both:
+                    self.assertEqual(write_config(self.etcd, 3, mirror, before, after), result)
+                    made = [('set_config_value',) + c[0] for c in mock_set.call_args_list] + \
+                           [(both,) + c[0] for c in mock_both.call_args_list]
+                    self.assertEqual(made, writes)
 
     def test_sync_state(self):
         self.assertIsNone(self.etcd.write_sync_state('leader', None, 0))

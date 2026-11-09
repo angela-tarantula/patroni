@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable, cast, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from kazoo.client import KazooClient, KazooRetry, KazooState
-from kazoo.exceptions import ConnectionClosedError, NodeExistsError, NoNodeError, SessionExpiredError
+from kazoo.exceptions import BadVersionError, ConnectionClosedError, NodeExistsError, NoNodeError, SessionExpiredError
 from kazoo.handlers.threading import AsyncResult, SequentialThreadingHandler
 from kazoo.protocol.states import KeeperState, WatchedEvent, ZnodeStat
 from kazoo.retry import RetryFailedError
@@ -16,7 +16,8 @@ from kazoo.security import ACL, make_acl
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+from . import AbstractDCS, Cluster, ClusterConfig, ClusterMaintenance, \
+    ConfigWrite, Failover, Leader, Member, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -239,6 +240,15 @@ class ZooKeeper(AbstractDCS):
         config = self.get_node(path + self._CONFIG, watch=self._watcher) if self._CONFIG in nodes else None
         config = config and ClusterConfig.from_node(config[1].version, config[0], config[1].mzxid)
 
+        # get the maintenance key, watching it only for our own group
+        watch = self._watcher if path == self.client_path('') else None
+        maintenance = self.get_node(path + self._MAINTENANCE, watch=watch) if self._MAINTENANCE in nodes else None
+        # A watch set through get() needs the node to exist, but the first pause or resume after a wipe creates it.
+        # If it was created after get_children() returned, exists() finds it and the loop wakes up at once.
+        if maintenance is None and watch and self._client.exists(path + self._MAINTENANCE, watch=watch):
+            self.event.set()
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance[1].version, maintenance[0])
+
         # get timeline history
         history = self.get_node(path + self._HISTORY) if self._HISTORY in nodes else None
         history = history and TimelineHistory.from_node(history[1].mzxid, history[0])
@@ -271,7 +281,8 @@ class ZooKeeper(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     def _mpp_cluster_loader(self, path: str) -> Dict[int, Cluster]:
         """Load and build all PostgreSQL clusters from a single MPP cluster.
@@ -345,6 +356,47 @@ class ZooKeeper(AbstractDCS):
 
     def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
         return self._set_or_create(self.config_path, value, version, retry=True) is not False
+
+    def set_maintenance_value(self, value: str, version: Optional[int] = None) -> bool:
+        # A newly created node has version 0, so unlike _set_or_create() the version is passed exactly as given.
+        value_bytes = value.encode('utf-8')
+        try:
+            if version is None:
+                self._client.retry(self._client.create, self.maintenance_path, value_bytes, makepath=True)
+            else:
+                self._client.retry(self._client.set, self.maintenance_path, value_bytes, version=version)
+            return True
+        except (BadVersionError, NodeExistsError, NoNodeError):
+            pass
+        except Exception:
+            logger.exception('Failed to update %s', self.maintenance_path)
+        return False
+
+    def _commit_config_and_maintenance(self, config: bytes, config_version: Optional[int],
+                                       maintenance: bytes, maintenance_version: Optional[int]) -> bool:
+        transaction = self._client.transaction()
+        if config_version is None and not self._client.exists(self.config_path):
+            # a transaction can not create missing parent nodes
+            self._client.ensure_path(self.client_path('').rstrip('/'))
+            transaction.create(self.config_path, config)
+        else:
+            transaction.set_data(self.config_path, config, -1 if config_version is None else config_version)
+        if maintenance_version is None:
+            transaction.create(self.maintenance_path, maintenance)
+        else:
+            transaction.set_data(self.maintenance_path, maintenance, maintenance_version)
+        return not any(isinstance(result, Exception) for result in transaction.commit())
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[int],
+                                         maintenance: str, maintenance_version: Optional[int]) -> ConfigWrite:
+        try:
+            # The transaction is built inside the retried call, because a committed call can not be sent again.
+            ret = self._client.retry(self._commit_config_and_maintenance, config.encode('utf-8'), config_version,
+                                     maintenance.encode('utf-8'), maintenance_version)
+        except Exception:
+            logger.exception('Failed to update %s and %s', self.config_path, self.maintenance_path)
+            ret = False
+        return ConfigWrite(ret, ret)
 
     def initialize(self, create_new: bool = True, sysid: str = "") -> bool:
         sysid_bytes = sysid.encode('utf-8')

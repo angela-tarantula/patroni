@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -20,8 +21,8 @@ from ..exceptions import DCSError
 from ..postgresql.misc import PostgresqlRole, PostgresqlState
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, parse_bool, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
-from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, \
-    Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
+from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, ClusterMaintenance, \
+    ConfigWrite, Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -382,6 +383,10 @@ class Consul(AbstractDCS):
         config = nodes.get(self._CONFIG)
         config = config and ClusterConfig.from_node(config['ModifyIndex'], config['Value'])
 
+        # get the maintenance key
+        maintenance = nodes.get(self._MAINTENANCE)
+        maintenance = maintenance and ClusterMaintenance.from_node(maintenance['ModifyIndex'], maintenance['Value'])
+
         # get timeline history
         history = nodes.get(self._HISTORY)
         history = history and TimelineHistory.from_node(history['ModifyIndex'], history['Value'])
@@ -417,7 +422,8 @@ class Consul(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe,
+                       maintenance=maintenance)
 
     @property
     def _consistency(self) -> str:
@@ -615,6 +621,35 @@ class Consul(AbstractDCS):
     @catch_consul_errors
     def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
         return self._client.kv.put(self.config_path, value, cas=version)
+
+    @catch_consul_errors
+    def set_maintenance_value(self, value: str, version: Optional[int] = None) -> bool:
+        return self._client.kv.put(self.maintenance_path, value, cas=0 if version is None else version)
+
+    @staticmethod
+    def _txn_put(key: str, value: str, index: Optional[int]) -> Dict[str, Any]:
+        """Build a KV operation for the ``/v1/txn`` endpoint.
+
+        :param index: the ``ModifyIndex`` the key must still have, ``0`` if it must not exist, or ``None`` to write
+                      unconditionally.
+        """
+        operation: Dict[str, Any] = {'Verb': 'set' if index is None else 'cas', 'Key': key,
+                                     'Value': base64.b64encode(value.encode('utf-8')).decode('utf-8')}
+        if index is not None:
+            operation['Index'] = index
+        return {'KV': operation}
+
+    @catch_consul_errors
+    def _txn(self, payload: List[Dict[str, Any]]) -> bool:
+        # A transaction that is rolled back returns 409, which python-consul raises as a ConsulException.
+        return bool(self._client.txn.put(payload))
+
+    def set_config_and_maintenance_value(self, config: str, config_version: Optional[int],
+                                         maintenance: str, maintenance_version: Optional[int]) -> ConfigWrite:
+        ret = self._txn([self._txn_put(self.config_path, config, config_version),
+                         self._txn_put(self.maintenance_path, maintenance,
+                                       0 if maintenance_version is None else maintenance_version)])
+        return ConfigWrite(ret, ret)
 
     @catch_consul_errors
     def _write_leader_optime(self, last_lsn: str) -> bool:

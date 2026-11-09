@@ -78,3 +78,14 @@ Feature: standby cluster
     And postgres-1 role is the primary after 10 seconds
     When I add the table foo2 to postgres-1
     Then table foo2 is present on postgres-0 after 20 seconds
+
+  Scenario: resume a paused standby cluster after the DCS is wiped
+    Given I run patronictl.py pause batman --wait
+    Then I receive a response returncode 0
+    When I wipe the DCS
+    # patronictl only sends requests to members it finds in the DCS, so wait for postgres-0 to re-register after the wipe
+    And "members/postgres-0" key in DCS has state=running after 20 seconds
+    When I run patronictl.py resume batman
+    Then I receive a response returncode 0
+    And postgres-0 is a leader after 20 seconds
+    And "config" key in DCS has pause=None after 20 seconds

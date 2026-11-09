@@ -60,6 +60,8 @@ What should I do if I lose my DCS cluster?
 
     If you face scenario ``2.`` or ``3.`` Patroni will take care of creating the status information again based on the current status of the cluster, and recreate the dynamic configuration on the DCS based on a backup file named ``patroni.dynamic.json`` which is stored inside the Postgres data directory of each member of the Patroni cluster.
 
+    A paused standby cluster is the exception: while it is paused, no member takes the leader lock, so nothing recreates the dynamic configuration. Run :ref:`patronictl_resume`, which records the resume even though the dynamic configuration is missing. A standby leader then takes the lock and recreates the dynamic configuration.
+
 What occurs if I lose majority in my DCS cluster?
     The DCS will become unresponsive, which will cause Patroni to demote the current read/write Postgres node.
 
