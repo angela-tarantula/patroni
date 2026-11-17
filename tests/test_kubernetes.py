@@ -11,7 +11,7 @@ from unittest.mock import Mock, mock_open, patch, PropertyMock
 
 import urllib3
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterMaintenance, get_dcs
 from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed, \
     K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException, Retry, \
     RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
@@ -24,7 +24,7 @@ from . import MockResponse, SleepException
 def mock_list_namespaced_config_map(*args, **kwargs):
     k8s_group_label = get_mpp({'citus': {'group': 0, 'database': 'postgres'}}).k8s_group_label
     metadata = {'resource_version': '1', 'labels': {'f': 'b'}, 'name': 'test-config',
-                'annotations': {'initialize': '123', 'config': '[]', 'history': '{}'}}
+                'annotations': {'initialize': '123', 'config': '[]', 'history': '{}', 'maintenance': '{"pause": true}'}}
     items = [k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata))]
     metadata.update({'name': 'test-leader',
                      'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s',
@@ -44,7 +44,8 @@ def mock_list_namespaced_config_map(*args, **kwargs):
     metadata.update({'name': 'test-1-leader', 'labels': {k8s_group_label: '1'},
                      'annotations': {'leader': 'p-3', 'ttl': '30s'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
-    metadata.update({'name': 'test-2-config', 'labels': {k8s_group_label: '2'}, 'annotations': {}})
+    metadata.update({'name': 'test-2-config', 'labels': {k8s_group_label: '2'},
+                     'annotations': {'maintenance': '{"pause": false}'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
 
     metadata = k8s_client.V1ObjectMeta(resource_version='1')
@@ -263,7 +264,7 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
 
     @patch('time.monotonic', Mock(return_value=time.monotonic() + 100))
     def test_get_cluster(self):
-        self.k.get_cluster()
+        self.assertEqual(self.k.get_cluster().maintenance, ClusterMaintenance('1', {'pause': True}))
 
         with patch.object(Kubernetes, '_wait_caches', Mock(side_effect=Exception)):
             self.assertRaises(KubernetesError, self.k.get_cluster)
@@ -273,6 +274,12 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
         cluster = self.k.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertTrue(cluster.config.modify_version)
+        self.assertIsNone(cluster.maintenance)
+        self.assertIsNone(cluster.workers[1].maintenance)
+        # an object holding only the mirror holds no configuration
+        self.assertEqual(cluster.workers[2].maintenance, ClusterMaintenance('1', {'pause': False}))
+        self.assertEqual(cluster.workers[2].config.modify_version, 0)
 
     @patch('patroni.dcs.kubernetes.logger.error')
     def test_get_mpp_coordinator(self, mock_logger):
@@ -327,6 +334,60 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
         with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map',
                           Mock(side_effect=k8s_client.rest.ApiException(409, '')), create=True):
             self.k.set_config_value('{}', 1)
+
+    def test_set_maintenance_value(self):
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_patch:
+            # create only: the cached object already carries the annotation, so nothing is written
+            self.assertFalse(self.k.set_maintenance_value('{}'))
+            mock_patch.assert_not_called()
+
+            # create only: the annotation is absent, so the patch is conditional on the cached object's version
+            del self.k._kinds.get(self.k.config_path).metadata.annotations['maintenance']
+            self.assertTrue(self.k.set_maintenance_value('{}'))
+            body = mock_patch.call_args[0][2]
+            self.assertEqual(body.metadata.resource_version, '1')
+            self.assertEqual(body.metadata.annotations, {'maintenance': '{}'})
+
+            self.assertTrue(self.k.set_maintenance_value('{"pause":true}', '2'))
+            self.assertEqual(mock_patch.call_args[0][2].metadata.resource_version, '2')
+
+        # create only: there is no object, so it is created
+        self.k._kinds._object_cache.pop(self.k.config_path)
+        with patch.object(k8s_client.CoreV1Api, 'create_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_create:
+            self.assertTrue(self.k.set_maintenance_value('{}'))
+            mock_create.assert_called_once()
+
+    def test_set_config_and_maintenance_value(self):
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map',
+                          Mock(side_effect=mock_namespaced_kind), create=True) as mock_patch:
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '1', '{"pause":true}', '1'), (True, True))
+            mock_patch.assert_called_once()
+            body = mock_patch.call_args[0][2]
+            self.assertEqual(body.metadata.resource_version, '1')
+            self.assertEqual(body.metadata.annotations, {'config': '{}', 'maintenance': '{"pause":true}'})
+
+            # creating the mirror next to an unconditional /config write is conditional on the cached object
+            self.k._kinds.set(self.k.config_path, k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(
+                name=self.k.config_path, resource_version='4', annotations={'config': '{}'})))
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', None, '{}', None), (True, True))
+            self.assertEqual(mock_patch.call_args[0][2].metadata.resource_version, '4')
+
+            # one object has one resource version, so two different versions mean one of them is stale
+            mock_patch.reset_mock()
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '2', '{}', '1'), (False, False))
+            mock_patch.assert_not_called()
+
+            mock_patch.side_effect = k8s_client.rest.ApiException(409, '')
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '2', '{}', '2'), (False, False))
+
+        # creating the mirror fails if the cached object already carries it, even with a /config version
+        self.k._kinds.set(self.k.config_path, k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(
+            name=self.k.config_path, resource_version='5', annotations={'config': '{}', 'maintenance': '{}'})))
+        with patch.object(k8s_client.CoreV1Api, 'patch_namespaced_config_map', create=True) as mock_patch:
+            self.assertEqual(self.k.set_config_and_maintenance_value('{}', '5', '{}', None), (False, False))
+            mock_patch.assert_not_called()
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_pod', create=True)
     def test_touch_member(self, mock_patch_namespaced_pod):
@@ -574,6 +635,24 @@ class TestCacheBuilder(BaseTestKubernetes):
             {'type': 'MDIFIED', 'object': {'metadata': {'name': self.k.config_path}}}
         ) + '\n').encode('utf-8'), b'{"object":{', b'"code":410}}\n']
         self.k._kinds._build_cache()
+
+    def test_process_event_maintenance(self):
+        def event(resource_version, maintenance, name=None, ev_type='MODIFIED'):
+            annotations = {'initialize': '123', 'config': '{}', 'history': '{}'}
+            if maintenance is not None:
+                annotations['maintenance'] = maintenance
+            return {'type': ev_type, 'object': {'metadata': {
+                'name': name or self.k.config_path, 'resourceVersion': resource_version, 'annotations': annotations}}}
+
+        for e, wakes in ((event('2', '{"pause": true}'), False),  # value unchanged
+                         (event('3', '{"pause": false}'), True),
+                         (event('4', None), True),
+                         (event('5', '{"pause": true}'), True),  # created by the first write after a wipe
+                         (event('6', None, ev_type='DELETED'), True),
+                         (event('7', '{"pause": true}', name='test-1-config', ev_type='ADDED'), False)):
+            self.k.event.clear()
+            self.k._kinds._process_event(e)
+            self.assertEqual(self.k.event.is_set(), wakes, e)
 
     @patch('patroni.dcs.kubernetes.logger.error', Mock(side_effect=SleepException))
     @patch('patroni.dcs.kubernetes.ObjectCache._build_cache', Mock(side_effect=Exception))

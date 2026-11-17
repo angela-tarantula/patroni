@@ -13,7 +13,7 @@ from click.testing import CliRunner
 from prettytable import PrettyTable
 
 from patroni.ctl import CtlPostgresqlRole
-from patroni.dcs import ClusterConfig, Leader, Member, SyncState
+from patroni.dcs import ClusterConfig, ClusterMaintenance, ConfigWrite, Leader, Member, SyncState
 from patroni.postgresql.misc import PostgresqlRole, PostgresqlState
 
 try:
@@ -679,6 +679,33 @@ class TestCtl(unittest.TestCase):
             result = self.runner.invoke(ctl, ['resume', 'dummy'])
             assert 'Can not find accessible cluster member' in result.output
 
+    @patch('patroni.ctl.request_patroni')
+    def test_pause_resume_guard(self, mock_request):
+        mock_request.return_value.status = 200
+        cluster = get_cluster_initialized_with_leader()
+        # /config, mirror -> the decision the DCS holds, or None if it holds none
+        for config, maintenance, decision in (
+                (ClusterConfig(1, {'pause': True}, 1), None, True),
+                (ClusterConfig(1, {}, 1), ClusterMaintenance(2, {'pause': True}), False),  # /config decides
+                (None, ClusterMaintenance(2, {'pause': True}), True),
+                (None, ClusterMaintenance(2, {'pause': False}), False),
+                (ClusterConfig(1, {}, 0), ClusterMaintenance(2, {'pause': True}), True),  # /config not valid
+                (None, ClusterMaintenance(2, {}), None),  # a mirror whose value can not be parsed
+                (None, None, None)):
+            for command, paused in (('pause', True), ('resume', False)):
+                with self.subTest(config=config, maintenance=maintenance, command=command):
+                    mock_request.reset_mock()
+                    with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=Cluster(
+                            cluster.initialize, config, *cluster[2:10], maintenance))):
+                        result = self.runner.invoke(ctl, [command, 'dummy'])
+                    if decision == paused:
+                        self.assertEqual(result.exit_code, 1)
+                        self.assertIn('Cluster is already paused' if paused else 'Cluster is not paused', result.output)
+                        mock_request.assert_not_called()
+                    else:
+                        self.assertEqual(result.exit_code, 0)
+                        self.assertEqual(mock_request.call_args[0][1:], ('patch', 'config', {'pause': paused or None}))
+
     def test_apply_config_changes(self):
         config = {"postgresql": {"parameters": {"work_mem": "4MB"}, "use_pg_rewind": True}, "ttl": 30}
 
@@ -797,6 +824,52 @@ class TestCtl(unittest.TestCase):
             result = self.runner.invoke(ctl, ['edit-config', 'dummy'])
             assert result.exit_code == 1
             assert 'The config key does not exist in the cluster dummy' in result.output
+
+    @patch('patroni.dcs.etcd.Etcd.set_config_value', Mock(return_value=True))
+    @patch('patroni.dcs.etcd.Etcd.set_config_and_maintenance_value')
+    def test_edit_config_pause(self, mock_write):
+        mock_write.return_value = ConfigWrite(True, True)
+        cluster = get_cluster_initialized_with_leader()
+        paused = Cluster(cluster.initialize, ClusterConfig(2, {'ttl': 30, 'pause': True}, 2), *cluster[2:10],
+                         ClusterMaintenance(3, {'pause': True, 'x': 1}))
+        with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=paused)):
+            # removing pause writes the mirror too, keeping its other fields, conditional on the versions read
+            result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'pause=null'])
+            self.assertEqual(result.exit_code, 0)
+            mock_write.assert_called_once_with('{"ttl":30}', 2, '{"pause":false,"x":1}', 3)
+
+            # a change that leaves pause alone writes only /config
+            mock_write.reset_mock()
+            result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'ttl=20'])
+            self.assertEqual(result.exit_code, 0)
+            mock_write.assert_not_called()
+
+        # a /config that is not valid does not decide pause, so the mirror is written too: conditional on its version,
+        # or created if it does not exist
+        for maintenance, maintenance_version in ((ClusterMaintenance(3, {'pause': True}), 3), (None, None)):
+            with self.subTest(maintenance=maintenance):
+                not_valid = Cluster(cluster.initialize, ClusterConfig(2, {}, 0), *cluster[2:10], maintenance)
+                mock_write.reset_mock()
+                with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=not_valid)):
+                    result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'ttl=20'])
+                self.assertEqual(result.exit_code, 0)
+                mock_write.assert_called_once_with('{"ttl":20}', 2, '{"pause":false}', maintenance_version)
+
+        # the class-level cluster: /config at version 1, not paused, no mirror, so the mirror is created
+        result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'pause=true'])
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_write.call_args[0][1:], (1, '{"pause":true}', None))
+
+        mock_write.return_value = ConfigWrite(True, False)
+        result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'pause=true'])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn('Failed to update the maintenance key', result.output)
+        self.assertIn('Configuration changed', result.output)
+
+        mock_write.return_value = ConfigWrite(False, False)
+        result = self.runner.invoke(ctl, ['edit-config', 'dummy', '--force', '-s', 'pause=true'])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn('Config modification aborted due to concurrent changes', result.output)
 
     @patch('patroni.ctl.request_patroni')
     def test_version(self, mock_request):

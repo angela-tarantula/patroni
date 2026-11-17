@@ -1,3 +1,5 @@
+import base64
+import json
 import unittest
 
 from unittest.mock import Mock, patch, PropertyMock
@@ -6,7 +8,7 @@ import consul
 
 from consul import ConsulException, NotFound
 
-from patroni.dcs import get_dcs
+from patroni.dcs import ClusterConfig, ClusterMaintenance, get_dcs
 from patroni.dcs.consul import AbstractDCS, Cluster, Consul, ConsulClient, ConsulError, \
     ConsulInternalError, HTTPClient, InvalidSession, InvalidSessionTTL, RetryFailedError
 from patroni.postgresql.misc import PostgresqlRole, PostgresqlState
@@ -29,6 +31,10 @@ def kv_get(self, key, **kwargs):
                   'ModifyIndex': 1334, 'Value': b''},
                  {'CreateIndex': 1334, 'Flags': 0, 'Key': key + '1/initialize', 'LockIndex': 0,
                   'ModifyIndex': 1334, 'Value': b'postgresql0'},
+                 {'CreateIndex': 1336, 'Flags': 0, 'Key': key + '1/maintenance', 'LockIndex': 0,
+                  'ModifyIndex': 1336, 'Value': b'{"pause": false}'},
+                 {'CreateIndex': 1335, 'Flags': 0, 'Key': key + 'maintenance', 'LockIndex': 0,
+                  'ModifyIndex': 1335, 'Value': b'{"pause": true}'},
                  {'CreateIndex': 1334, 'Flags': 0, 'Key': key + 'initialize', 'LockIndex': 0,
                   'ModifyIndex': 1334, 'Value': b'postgresql0'},
                  {'CreateIndex': 2621, 'Flags': 0, 'Key': key + 'leader', 'LockIndex': 1,
@@ -57,6 +63,10 @@ def kv_get(self, key, **kwargs):
     if key == 'service/legacy/':
         good_cls[1].pop()
         return good_cls
+    if key == 'service/nomaintenance/':
+        good_cls[1].append({'CreateIndex': 1337, 'Flags': 0, 'Key': key + 'config', 'LockIndex': 0,
+                            'ModifyIndex': 1337, 'Value': b'{"pause": true}'})
+        return good_cls[0], [n for n in good_cls[1] if n['Key'] != key + 'maintenance']
     raise ConsulException
 
 
@@ -135,21 +145,28 @@ class TestConsul(unittest.TestCase):
 
     @patch.object(KV, 'delete', Mock())
     def test_get_cluster(self):
+        self.assertEqual(self.c.get_cluster().maintenance, ClusterMaintenance(1335, {'pause': True}))
         self.c._base_path = 'service/test'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
-        self.assertIsInstance(self.c.get_cluster(), Cluster)
+        self.assertIsNone(self.c.get_cluster().maintenance)
         self.c._base_path = 'service/fail'
         self.assertRaises(ConsulError, self.c.get_cluster)
         self.c._base_path = 'service/broken'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
         self.c._base_path = 'service/legacy'
         self.assertIsInstance(self.c.get_cluster(), Cluster)
+        self.c._base_path = 'service/nomaintenance'
+        cluster = self.c.get_cluster()
+        self.assertEqual(cluster.config, ClusterConfig(1337, {'pause': True}, 1337))
+        self.assertIsNone(cluster.maintenance)
 
     def test__get_citus_cluster(self):
         self.c._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
         cluster = self.c.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
+        self.assertEqual(cluster.workers[1].maintenance, ClusterMaintenance(1336, {'pause': False}))
+        self.assertIsNone(cluster.workers[1].config)
 
     @patch.object(KV, 'delete', Mock(side_effect=[ConsulException, True, True, True]))
     @patch.object(KV, 'put', Mock(side_effect=[True, ConsulException, InvalidSession]))
@@ -180,6 +197,46 @@ class TestConsul(unittest.TestCase):
     @patch.object(KV, 'put', Mock(return_value=True))
     def test_set_config_value(self):
         self.c.set_config_value('')
+
+    def test_set_maintenance_value(self):
+        with patch.object(KV, 'put', Mock(return_value=True)) as mock_put:
+            self.assertTrue(self.c.set_maintenance_value('{}'))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=0)
+            self.assertTrue(self.c.set_maintenance_value('{}', 5))
+            mock_put.assert_called_with('service/good/maintenance', '{}', cas=5)
+        with patch.object(KV, 'put', Mock(side_effect=ConsulException)):
+            self.assertFalse(self.c.set_maintenance_value('{}'))
+
+    def test_set_config_and_maintenance_value(self):
+        def kv(verb, key, value, index=None):
+            ret = {'Verb': verb, 'Key': key, 'Value': base64.b64encode(value.encode('utf-8')).decode('utf-8')}
+            if index is not None:
+                ret['Index'] = index
+            return {'KV': ret}
+
+        with patch.object(self.c._client.http.http, 'request') as mock_request:
+            mock_request.return_value.status = 200
+            mock_request.return_value.data = b'{"Results": []}'
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', None, '{"pause":true}', None), (True, True))
+            self.assertEqual(mock_request.call_args[0], ('PUT', 'http://localhost:1/v1/txn'))
+            self.assertEqual(json.loads(mock_request.call_args[1]['body']),
+                             [kv('set', 'service/good/config', '{}'),
+                              kv('cas', 'service/good/maintenance', '{"pause":true}', 0)])
+            self.c.set_config_and_maintenance_value('{}', 5, '{}', 6)
+            self.assertEqual(json.loads(mock_request.call_args[1]['body']),
+                             [kv('cas', 'service/good/config', '{}', 5),
+                              kv('cas', 'service/good/maintenance', '{}', 6)])
+
+            # the transaction goes to the configured datacenter, as kv.get() and kv.put() do
+            with patch.object(self.c._client, 'dc', 'dc2'):
+                self.c.set_config_and_maintenance_value('{}', 5, '{}', 6)
+                self.assertEqual(mock_request.call_args[0], ('PUT', 'http://localhost:1/v1/txn?dc=dc2'))
+
+            # a transaction that is rolled back returns 409
+            mock_request.return_value.status = 409
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', 5, '{}', 6), (False, False))
+            mock_request.return_value.status = 500
+            self.assertEqual(self.c.set_config_and_maintenance_value('{}', 5, '{}', 6), (False, False))
 
     @patch.object(Cluster, 'min_version', PropertyMock(return_value=(2, 0)))
     @patch.object(KV, 'put', Mock(side_effect=ConsulException))
